@@ -1,0 +1,14 @@
+{
+  "name": "playwright-automation",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc",
+    "scrape": "npm run build && node dist/scraper.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}

@@ -1,0 +1,11 @@
+version: "3.8"
+
+services:
+  scraper:
+    build: .
+    container_name: playwright-scraper
+    volumes:
+      - .:/app
+    environment:
+      - NODE_ENV=development
+    command: npm run scrape

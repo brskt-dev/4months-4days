@@ -118,6 +118,11 @@ export async function extractTotalReports(page: Page) {
   console.log(`- Registros da última página:   ${lastPageCount}`);
   console.log(`- TOTAL GERAL DE RELATÓRIOS:    ${totalReports}`);
 
+  // 🔥 VOLTA PARA A PÁGINA 1 ANTES DE RETORNAR
+  console.log("➡️ Retornando para a página 1...");
+  await page.goto("https://app.produttivo.com.br/form_fills?page=1");
+  await page.waitForSelector(".formFill-card table tbody tr");
+
   return {
     reportsPerPage: rowsCount,
     lastPageCount,
@@ -131,60 +136,73 @@ export async function extractTotalReports(page: Page) {
  * @param page Playwright Page
  * @param exportButtonSelector seletor do botão <a> que abre o modal
  */
-export async function downloadReport(page: Page, exportButtonSelector: string): Promise<void> {
-  console.log(`➡️ Iniciando download do relatório usando: ${exportButtonSelector}`);
+export async function downloadReport(
+  page: Page,
+  exportButtonSelector: string
+): Promise<void> {
+  console.log(
+    `➡️ Iniciando download do relatório usando: ${exportButtonSelector}`
+  );
 
-  // Clica no botão de exportação
+  // Abre o popup
   await page.click(exportButtonSelector);
 
-  // Aguarda o modal abrir
-  await page.waitForSelector(".modal-content", { timeout: 15000 });
+  // Aguarda o modal REAL abrir
+  await page.waitForSelector("#newExportRequestModalLabel", { timeout: 15000 });
+
+  const modal = page.locator("div.modal-content:visible");
 
   console.log("➡️ Modal aberto, selecionando tipo de exportação...");
 
-  // Aguarda select
-  await page.waitForSelector("#export_request_export_profile_id");
+  // Seleciona option
+  await modal.locator("#export_request_export_profile_id").waitFor();
+  const options = await modal
+    .locator("#export_request_export_profile_id option")
+    .all();
 
-  // Seleciona a primeira opção automaticamente
-  const options = await page.$$("#export_request_export_profile_id option");
-
-  if (options.length === 0) {
+  if (options.length === 0)
     throw new Error("Nenhuma opção de exportação disponível!");
-  }
 
   const firstValue = await options[0].getAttribute("value");
-
-  await page.selectOption("#export_request_export_profile_id", firstValue!);
+  await modal
+    .locator("#export_request_export_profile_id")
+    .selectOption(firstValue!);
 
   console.log(`➡️ Tipo selecionado: option value = ${firstValue}`);
 
-  // Clica no botão EXPORTAR
-  await page.waitForSelector("#confirm_export_button", { timeout: 5000 });
-  await page.click("#confirm_export_button");
+  // Clica Exportar
+  await modal.locator("#confirm_export_button").click();
 
-  console.log("➡️ Relatório enviado para processamento...");
+  console.log("➡️ Gerando relatório...");
 
-  // Espera o estado de "Loading" aparecer (opcional, mas deixa mais seguro)
-  await page.waitForSelector("#fileExportLoading", { state: "visible", timeout: 10000 }).catch(() => {});
+  // Loading
+  await modal
+    .locator("#fileExportLoading")
+    .waitFor({ state: "visible", timeout: 10000 })
+    .catch(() => {});
 
-  // Espera o estado final "fileExportReady" aparecer
-  await page.waitForSelector("#fileExportReady", { state: "visible", timeout: 60000 }).catch(() => {
-    console.warn("⚠️ Timeout esperando 'ready', mas talvez o download já tenha iniciado.");
-  });
+  // Final
+  await modal
+    .locator("#fileExportReady")
+    .waitFor({ state: "visible", timeout: 60000 })
+    .catch(() => {
+      console.warn(
+        "⚠️ Timeout esperando 'ready', mas o download pode ter sido automático."
+      );
+    });
 
-  // Clicar no link de download caso necessário
-  const link = await page.$("#fileDownloadLink");
-  if (link) {
-    console.log("➡️ Forçando download pelo link...");
+  // Força download se aparecer
+  const link = modal.locator("#fileDownloadLink");
+  if (await link.isVisible()) {
+    console.log("➡️ Forçando download via link...");
     await link.click().catch(() => {});
   }
 
-  // Agora espera o modal fechar completamente
-  await page.waitForSelector(".modal-content", { state: "hidden", timeout: 15000 });
+  // Espera modal fechar
+  await modal.waitFor({ state: "hidden", timeout: 15000 });
 
   console.log("✅ Relatório baixado com sucesso!");
 
-  // garantir que popups não bloqueiem a UI após fechar o modal
   await closeOnboardingPopup(page);
 }
 
@@ -194,13 +212,20 @@ export async function downloadReport(page: Page, exportButtonSelector: string): 
  * @param pageIndex índice da página (1-based) para logs
  * @returns número de relatórios baixados com sucesso
  */
-export async function downloadReportsFromPage(page: Page, pageIndex: number): Promise<number> {
+export async function downloadReportsFromPage(
+  page: Page,
+  pageIndex: number
+): Promise<number> {
   console.log(`\n📄 [PAGE ${pageIndex}] Extraindo relatórios desta página...`);
 
   // Seleciona apenas os botões dentro da tabela correta
-  const exportButtons = await page.$$('.formFill-card tbody tr td.column-export a');
+  const exportButtons = await page.$$(
+    ".formFill-card tbody tr td.column-export a"
+  );
 
-  console.log(`➡️ Encontrados ${exportButtons.length} relatórios nesta página.`);
+  console.log(
+    `➡️ Encontrados ${exportButtons.length} relatórios nesta página.`
+  );
 
   let successCount = 0;
 
@@ -216,7 +241,11 @@ export async function downloadReportsFromPage(page: Page, pageIndex: number): Pr
 
     const selector = `#${id}`;
 
-    console.log(`➡️ [${i + 1}/${exportButtons.length}] Baixando relatório (${selector})...`);
+    console.log(
+      `➡️ [${i + 1}/${
+        exportButtons.length
+      }] Baixando relatório (${selector})...`
+    );
 
     try {
       await downloadReport(page, selector);
@@ -229,7 +258,9 @@ export async function downloadReportsFromPage(page: Page, pageIndex: number): Pr
     await closeOnboardingPopup(page);
   }
 
-  console.log(`✅ Página ${pageIndex}: ${successCount}/${exportButtons.length} baixados com sucesso.`);
+  console.log(
+    `✅ Página ${pageIndex}: ${successCount}/${exportButtons.length} baixados com sucesso.`
+  );
 
   return successCount;
 }

@@ -1,3 +1,4 @@
+import fs from "fs";
 import { Page } from "playwright";
 import { closeOnboardingPopup } from "./helpers/closePopup";
 
@@ -191,12 +192,25 @@ export async function downloadReport(
       );
     });
 
-  // Força download se aparecer
-  const link = modal.locator("#fileDownloadLink");
-  if (await link.isVisible()) {
-    console.log("➡️ Forçando download via link...");
-    await link.click().catch(() => {});
+  const downloadPromise = page.waitForEvent("download");
+
+  if (await modal.locator("#fileDownloadLink").isVisible()) {
+    await modal.locator("#fileDownloadLink").click();
   }
+
+  // aguarda
+  const download = await downloadPromise;
+
+  // nome original sugerido
+  const suggested = download.suggestedFilename();
+
+  // cria diretório local, se não existir
+  await fs.promises.mkdir("downloads", { recursive: true });
+
+  // salva
+  await download.saveAs(`downloads/${suggested}`);
+
+  console.log(`📥 Download salvo como: downloads/${suggested}`);
 
   // Espera modal fechar
   await modal.waitFor({ state: "hidden", timeout: 15000 });

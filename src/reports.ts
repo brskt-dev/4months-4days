@@ -29,47 +29,96 @@ export async function goToReports(page: Page): Promise<Page> {
 }
 
 /**
- * Aplica o filtro de datas "Personalizado" com intervalo de 01/01/2000 até hoje.
- * @param page Playwright Page
+ * Aplica filtros direto pela URL da Produttivo.
+ * Eliminamos cliques, dropdowns e datepickers.
  */
-export async function applyDateFilter(page: Page): Promise<void> {
-  console.log("➡️ Aplicando filtro de datas...");
+export async function applyFilters(
+  page: Page,
+  options: {
+    formId?: string | null;
+    startDate: string;
+    endDate: string;
+  }
+) {
+  console.log("➡️ Aplicando filtros via URL...");
 
-  // abre o datepicker
-  await page.waitForSelector("#formFill-rangeDate");
-  await page.click("#formFill-rangeDate");
+  const { formId, startDate, endDate } = options;
 
-  // espera o dropdown do datepicker aparecer
-  await page.waitForSelector(".daterangepicker", { state: "visible" });
+  const base = "https://app.produttivo.com.br/form_fills";
+  const url = new URL(base);
 
-  console.log("➡️ Selecionando modo Personalizado...");
+  url.searchParams.append("utf8", "✓");
 
-  // clica na opção "Personalizado"
-  await page.click('.ranges ul li[data-range-key="Personalizado"]');
+  // Formulário
+  if (formId) {
+    url.searchParams.append("form_fill[form_ids][]", formId);
+  } else {
+    url.searchParams.append("form_fill[form_ids][]", "");
+  }
 
-  // preenchendo o campo ESQUERDO
-  console.log("➡️ Preenchendo data inicial...");
+  // Range de datas
+  url.searchParams.append("range_time", `${startDate} - ${endDate}`);
 
-  await page.fill('input[name="daterangepicker_start"]', "01/01/2000");
+  url.searchParams.append("account_id", "259345");
+  url.searchParams.append("field_id", "-2");
+  url.searchParams.append("order_type", "desc");
 
-  // (campo da direita não precisa alterar — já vem com hoje e está correto)
+  const finalUrl = url.toString();
 
-  // botão aplicar (dentro do picker)
-  console.log("➡️ Aplicando intervalo no picker...");
-  await page.click(".applyBtn.btn.btn-sm.btn-success");
+  console.log("🔗 URL Final dos filtros:");
+  console.log(finalUrl);
 
-  // agora sim clicar no botão Filtrar da página
-  console.log("➡️ Clicando em 'Filtrar'...");
-
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: "networkidle" }),
-    page.click(".formFill-submit"),
-  ]);
-
-  // só para garantir que nenhum popup atrapalhe
   await closeOnboardingPopup(page);
 
-  console.log("✅ Filtro aplicado com sucesso!");
+  await page.goto(finalUrl, { waitUntil: "networkidle" });
+
+  await closeOnboardingPopup(page);
+
+  console.log("✅ Filtros aplicados com sucesso!");
+}
+
+/**
+ * Extrai todos os tipos de formulários disponíveis no filtro.
+ */
+export async function extractFormTypes(page: Page) {
+  console.log("➡️ Extraindo lista de formulários...");
+
+  // abre o dropdown correto
+  await page.click(".multiselect-option .multiselect.dropdown-toggle");
+  await closeOnboardingPopup(page);
+
+  // espera os itens carregarem
+  await page.waitForSelector(".multiselect-container li label.checkbox");
+
+  const items = await page.$$(".multiselect-container li label.checkbox");
+
+  const forms = [];
+
+  for (const item of items) {
+    const input = await item.$("input[type='checkbox']");
+    if (!input) continue;
+
+    const formId = await input.getAttribute("value");
+    const label = (await item.innerText()).trim();
+
+    // ignora valores inválidos
+    if (!formId || isNaN(Number(formId))) continue;
+
+    // ignora itens que não são formulários
+    if (label.toLowerCase().includes("projeto")) continue;
+
+    forms.push({ id: formId, name: label });
+  }
+
+  // fecha dropdown para não atrapalhar UI
+  await page.click(".multiselect-option .multiselect.dropdown-toggle");
+
+  console.log("📌 Tipos encontrados:");
+  forms.forEach((f) => console.log(` - [${f.id}] ${f.name}`));
+
+  console.log(`📌 ${forms.length} formulários detectados.`);
+
+  return forms;
 }
 
 /**
@@ -133,17 +182,27 @@ export async function extractTotalReports(page: Page) {
 }
 
 /**
- * Baixa um único relatório.
+ * Baixa um único relatório e salva dentro da pasta do tipo de formulário.
  * @param page Playwright Page
  * @param exportButtonSelector seletor do botão <a> que abre o modal
+ * @param formName Nome do formulário atual (ex: "Teste 01")
  */
 export async function downloadReport(
   page: Page,
-  exportButtonSelector: string
+  exportButtonSelector: string,
+  formName: string
 ): Promise<void> {
   console.log(
     `➡️ Iniciando download do relatório usando: ${exportButtonSelector}`
   );
+
+  // Sanitiza nome da pasta
+  const safeName = formName
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // remove acentos
+    .replace(/[^a-zA-Z0-9_-]/g, "_"); // troca caracteres especiais
+
+  const folder = `downloads/${safeName}`;
 
   // Abre o popup
   await page.click(exportButtonSelector);
@@ -171,52 +230,44 @@ export async function downloadReport(
 
   console.log(`➡️ Tipo selecionado: option value = ${firstValue}`);
 
-  // Clica Exportar
+  // Exportar
   await modal.locator("#confirm_export_button").click();
-
   console.log("➡️ Gerando relatório...");
 
-  // Loading
+  // Loading e Ready
   await modal
     .locator("#fileExportLoading")
     .waitFor({ state: "visible", timeout: 10000 })
     .catch(() => {});
-
-  // Final
   await modal
     .locator("#fileExportReady")
     .waitFor({ state: "visible", timeout: 60000 })
-    .catch(() => {
-      console.warn(
-        "⚠️ Timeout esperando 'ready', mas o download pode ter sido automático."
-      );
-    });
+    .catch(() => {});
 
   const downloadPromise = page.waitForEvent("download");
 
   if (await modal.locator("#fileDownloadLink").isVisible()) {
-    await modal.locator("#fileDownloadLink").click();
+    await modal
+      .locator("#fileDownloadLink")
+      .click()
+      .catch(() => {});
   }
 
-  // aguarda
   const download = await downloadPromise;
-
-  // nome original sugerido
   const suggested = download.suggestedFilename();
 
-  // cria diretório local, se não existir
-  await fs.promises.mkdir("downloads", { recursive: true });
+  // Cria pasta específica
+  await fs.promises.mkdir(folder, { recursive: true });
 
-  // salva
-  await download.saveAs(`downloads/${suggested}`);
+  const savePath = `${folder}/${suggested}`;
 
-  console.log(`📥 Download salvo como: downloads/${suggested}`);
+  await download.saveAs(savePath);
 
-  // Espera modal fechar
+  console.log(`📥 Download salvo como: ${savePath}`);
+
   await modal.waitFor({ state: "hidden", timeout: 15000 });
 
   console.log("✅ Relatório baixado com sucesso!");
-
   await closeOnboardingPopup(page);
 }
 
@@ -228,15 +279,14 @@ export async function downloadReport(
  */
 export async function downloadReportsFromPage(
   page: Page,
-  pageIndex: number
+  pageIndex: number,
+  formName: string
 ): Promise<number> {
   console.log(`\n📄 [PAGE ${pageIndex}] Extraindo relatórios desta página...`);
 
-  // Seleciona apenas os botões dentro da tabela correta
   const exportButtons = await page.$$(
     ".formFill-card tbody tr td.column-export a"
   );
-
   console.log(
     `➡️ Encontrados ${exportButtons.length} relatórios nesta página.`
   );
@@ -246,7 +296,6 @@ export async function downloadReportsFromPage(
   for (let i = 0; i < exportButtons.length; i++) {
     const btn = exportButtons[i];
 
-    // recupera o id do botão para clicar via seletor
     const id = await btn.getAttribute("id");
     if (!id) {
       console.warn("⚠️ Botão sem ID detectado — ignorando.");
@@ -254,7 +303,6 @@ export async function downloadReportsFromPage(
     }
 
     const selector = `#${id}`;
-
     console.log(
       `➡️ [${i + 1}/${
         exportButtons.length
@@ -262,11 +310,10 @@ export async function downloadReportsFromPage(
     );
 
     try {
-      await downloadReport(page, selector);
+      await downloadReport(page, selector, formName);
       successCount++;
     } catch (err) {
       console.error(`❌ Erro ao baixar relatório ${id}:`, err);
-      // continua mesmo assim
     }
 
     await closeOnboardingPopup(page);

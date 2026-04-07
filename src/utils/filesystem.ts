@@ -5,6 +5,19 @@ export async function ensureDir(dirPath: string): Promise<void> {
   await fs.promises.mkdir(dirPath, { recursive: true });
 }
 
+function isRetryableFileWriteError(error: unknown): boolean {
+  if (!(error instanceof Error) || !("code" in error)) {
+    return false;
+  }
+
+  const code = String((error as NodeJS.ErrnoException).code ?? "");
+  return ["EPERM", "EBUSY", "ENOTEMPTY", "EMFILE"].includes(code);
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function fileExists(filePath: string): Promise<boolean> {
   try {
     await fs.promises.access(filePath, fs.constants.F_OK);
@@ -19,9 +32,34 @@ export async function writeJsonAtomic(
   data: unknown
 ): Promise<void> {
   await ensureDir(path.dirname(filePath));
-  const tempPath = `${filePath}.tmp`;
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random()
+    .toString(16)
+    .slice(2)}.tmp`;
   await fs.promises.writeFile(tempPath, JSON.stringify(data, null, 2), "utf8");
-  await fs.promises.rename(tempPath, filePath);
+
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      await fs.promises.copyFile(tempPath, filePath);
+      await fs.promises.unlink(tempPath).catch(() => undefined);
+      return;
+    } catch (error) {
+      lastError = error;
+
+      if (!isRetryableFileWriteError(error) || attempt === 5) {
+        await fs.promises.unlink(tempPath).catch(() => undefined);
+        throw error;
+      }
+
+      await sleep(attempt * 200);
+    }
+  }
+
+  await fs.promises.unlink(tempPath).catch(() => undefined);
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Falha ao persistir arquivo JSON.");
 }
 
 export async function readJsonFile<T>(

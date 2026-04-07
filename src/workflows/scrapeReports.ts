@@ -39,6 +39,17 @@ export async function runReportScraping(): Promise<void> {
   let processedItemCount = 0;
   let scopeSummaries: ReturnType<typeof buildExecutionSummary>["filtersProcessed"] =
     [];
+  let controlSaveQueue = Promise.resolve();
+  let processedSinceLastSave = 0;
+
+  const saveControlState = async (): Promise<void> => {
+    const task = controlSaveQueue
+      .catch(() => undefined)
+      .then(() => saveControlFile(config.paths.controlFile, controlFile));
+
+    controlSaveQueue = task.catch(() => undefined);
+    await task;
+  };
 
   try {
     await writeRunArtifacts(runDir, {
@@ -104,7 +115,7 @@ export async function runReportScraping(): Promise<void> {
       );
     }
 
-    await saveControlFile(config.paths.controlFile, controlFile);
+    await saveControlState();
 
     const queue = await buildExecutionQueue(executionRecords, runId, logger);
     await logger.info("execution", "Fila de execucao preparada.", {
@@ -115,10 +126,15 @@ export async function runReportScraping(): Promise<void> {
     processedItemCount = queue.length;
 
     await processExecutionQueue(page, queue, runId, logger, async () => {
-      await saveControlFile(config.paths.controlFile, controlFile);
+      processedSinceLastSave += 1;
+
+      if (processedSinceLastSave >= 10) {
+        processedSinceLastSave = 0;
+        await saveControlState();
+      }
     });
 
-    await saveControlFile(config.paths.controlFile, controlFile);
+    await saveControlState();
 
     const finishedAt = nowIso();
     const summary = buildExecutionSummary(
@@ -149,7 +165,7 @@ export async function runReportScraping(): Promise<void> {
   } catch (error) {
     const finishedAt = nowIso();
 
-    await saveControlFile(config.paths.controlFile, controlFile);
+    await saveControlState();
     await writeRunArtifacts(runDir, {
       runId,
       startedAt,

@@ -441,9 +441,15 @@ export async function processExecutionQueue(
   }
 
   let nextIndex = 0;
+  let fatalError: Error | null = null;
+
   await Promise.all(
     pages.map(async (page) => {
       while (true) {
+        if (fatalError) {
+          break;
+        }
+
         const currentIndex = nextIndex;
         nextIndex += 1;
 
@@ -451,13 +457,23 @@ export async function processExecutionQueue(
           break;
         }
 
-        await processSingleRecord(page, queue[currentIndex], runId, logger);
-        await onRecordProcessed();
+        try {
+          await processSingleRecord(page, queue[currentIndex], runId, logger);
+          await onRecordProcessed();
+        } catch (error) {
+          fatalError =
+            error instanceof Error ? error : new Error(String(error));
+          break;
+        }
       }
     })
   );
 
   for (const page of pages.slice(1)) {
     await page.close();
+  }
+
+  if (fatalError) {
+    throw fatalError;
   }
 }

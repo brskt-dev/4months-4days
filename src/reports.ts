@@ -4,8 +4,8 @@ import { Locator, Page } from "playwright";
 import { ROUTES, SELECTORS, TIMEOUTS } from "./constants";
 import { closeOnboardingPopup } from "./helpers/closePopup";
 import { FormType, RawReportRow, ReportFilters, ReportTotals } from "./types";
-import { buildReportsUrl, withPage } from "./utils/reportUrls";
 import { extractExportButtonId, extractReportIdFromRow } from "./utils/reportMetadata";
+import { buildReportsUrl, withPage } from "./utils/reportUrls";
 
 function buildIdSelector(id: string): string {
   const escaped = id.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -24,7 +24,11 @@ async function waitForReportTable(page: Page): Promise<void> {
 async function tryExtractExportRequestId(modal: Locator): Promise<string | null> {
   try {
     return await modal.evaluate((element) => {
-      const attributes = Array.from(element.querySelectorAll("[data-export-request-id], [data-request-id], input[type='hidden']"))
+      const attributes = Array.from(
+        element.querySelectorAll(
+          "[data-export-request-id], [data-request-id], input[type='hidden']"
+        )
+      )
         .flatMap((node) => {
           const result: string[] = [];
           if (node instanceof HTMLElement) {
@@ -55,7 +59,12 @@ async function waitForExportReady(
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < TIMEOUTS.exportReady) {
-    if (await modal.locator(SELECTORS.exportReadyState).isVisible().catch(() => false)) {
+    if (
+      await modal
+        .locator(SELECTORS.exportReadyState)
+        .isVisible()
+        .catch(() => false)
+    ) {
       return;
     }
 
@@ -118,10 +127,6 @@ export async function extractFormTypes(page: Page): Promise<FormType[]> {
       continue;
     }
 
-    if (label.toLowerCase().includes("projeto")) {
-      continue;
-    }
-
     forms.push({ id: formId, name: label });
   }
 
@@ -179,7 +184,9 @@ export async function extractRawRowsFromCurrentPage(
         }));
 
         const actions = Array.from(
-          row.querySelectorAll("a, button, input[type='button'], input[type='submit']")
+          row.querySelectorAll(
+            "a, button, input[type='button'], input[type='submit']"
+          )
         ).map((element) => {
           const dataset: Record<string, string> = {};
           Object.entries((element as HTMLElement).dataset ?? {}).forEach(
@@ -193,10 +200,7 @@ export async function extractRawRowsFromCurrentPage(
           return {
             id: (element as HTMLElement).id || null,
             text: element.textContent?.replace(/\s+/g, " ").trim() ?? "",
-            href:
-              element instanceof HTMLAnchorElement
-                ? element.href
-                : null,
+            href: element instanceof HTMLAnchorElement ? element.href : null,
             dataset,
           };
         });

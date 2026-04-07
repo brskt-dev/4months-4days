@@ -30,7 +30,39 @@ function collectNumericTokens(value: string): string[] {
   return value.match(/\b\d{4,}\b/g) ?? [];
 }
 
+function extractStrongFormFillId(row: RawReportRow): string | null {
+  for (const action of row.actions) {
+    if (action.dataset.id && /^\d+$/.test(action.dataset.id)) {
+      return action.dataset.id;
+    }
+
+    const actionIdMatch = action.id?.match(/export_form_fill_button-(\d+)/i);
+    if (actionIdMatch) {
+      return actionIdMatch[1];
+    }
+
+    const hrefMatch = action.href?.match(/form_fills\/(\d+)/i);
+    if (hrefMatch) {
+      return hrefMatch[1];
+    }
+  }
+
+  for (const link of row.links) {
+    const hrefMatch = link.match(/form_fills\/(\d+)/i);
+    if (hrefMatch) {
+      return hrefMatch[1];
+    }
+  }
+
+  return null;
+}
+
 export function extractReportIdFromRow(row: RawReportRow): string | null {
+  const strongId = extractStrongFormFillId(row);
+  if (strongId) {
+    return strongId;
+  }
+
   const scored = new Map<string, number>();
 
   const idCellText = findCellTextByHeader(row, ID_HEADERS);

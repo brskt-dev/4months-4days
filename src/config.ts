@@ -20,6 +20,11 @@ const baseUrl = (
   process.env.PRODUTTIVO_BASE_URL ?? "https://app.produttivo.com.br"
 ).replace(/\/$/, "");
 
+const reportLocalQueryParam =
+  process.env.REPORT_LOCAL_QUERY_PARAM?.trim() ||
+  "form_fill[resource_place_ids][]";
+const reportAssetQueryParam = process.env.REPORT_ASSET_QUERY_PARAM?.trim() ?? "";
+
 const downloadsDir = process.env.DOWNLOADS_DIR ?? "downloads";
 const artifactsDir = process.env.AUTOMATION_ARTIFACTS_DIR ?? "automation-artifacts";
 
@@ -34,8 +39,8 @@ export const config = {
     accountId: process.env.PRODUTTIVO_ACCOUNT_ID ?? "259345",
     defaultStartDate: process.env.REPORT_START_DATE ?? "01/01/2000",
     defaultEndDate: process.env.REPORT_END_DATE ?? "31/12/2025",
-    localQueryParam: process.env.REPORT_LOCAL_QUERY_PARAM ?? "",
-    assetQueryParam: process.env.REPORT_ASSET_QUERY_PARAM ?? "",
+    localQueryParam: reportLocalQueryParam,
+    assetQueryParam: reportAssetQueryParam,
   },
   execution: {
     extractionPlanFile: process.env.EXTRACTION_PLAN_FILE ?? "",

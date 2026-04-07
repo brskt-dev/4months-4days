@@ -3,6 +3,11 @@ export type FormType = {
   name: string;
 };
 
+export type ResourcePlace = {
+  id: string;
+  name: string;
+};
+
 export type ReportFilters = {
   formId?: string | null;
   localId?: string | null;

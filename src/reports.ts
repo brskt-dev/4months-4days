@@ -3,13 +3,41 @@ import path from "node:path";
 import { Locator, Page } from "playwright";
 import { ROUTES, SELECTORS, TIMEOUTS } from "./constants";
 import { closeOnboardingPopup } from "./helpers/closePopup";
-import { FormType, RawReportRow, ReportFilters, ReportTotals } from "./types";
+import {
+  FormType,
+  RawReportRow,
+  ReportFilters,
+  ReportTotals,
+  ResourcePlace,
+} from "./types";
 import { extractExportButtonId, extractReportIdFromRow } from "./utils/reportMetadata";
 import { buildReportsUrl, withPage } from "./utils/reportUrls";
 
 function buildIdSelector(id: string): string {
   const escaped = id.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   return `[id="${escaped}"]`;
+}
+
+async function waitForResourcePlaceOptions(page: Page): Promise<boolean> {
+  return page
+    .waitForFunction(
+      (selector) => {
+        const element = document.querySelector(selector);
+        if (!(element instanceof HTMLSelectElement)) {
+          return false;
+        }
+
+        return [...element.options].some(
+          (option) =>
+            Boolean(option.value?.trim()) &&
+            !Number.isNaN(Number(option.value.trim()))
+        );
+      },
+      SELECTORS.reportResourcePlaceSelect,
+      { timeout: 30_000, polling: 1_000 }
+    )
+    .then(() => true)
+    .catch(() => false);
 }
 
 async function waitForReportTable(page: Page): Promise<void> {
@@ -108,30 +136,114 @@ export async function applyFilters(
 }
 
 export async function extractFormTypes(page: Page): Promise<FormType[]> {
-  await page.click(SELECTORS.reportFormDropdown);
+  const dropdown = page.locator(SELECTORS.reportFormDropdown).first();
+  await dropdown.click();
   await closeOnboardingPopup(page);
-  await page.waitForSelector(SELECTORS.reportFormOptions);
+  const menu = dropdown
+    .locator("xpath=following-sibling::ul[contains(@class, 'multiselect-container')]")
+    .first();
+  await menu.waitFor();
 
-  const items = await page.$$(SELECTORS.reportFormOptions);
-  const forms: FormType[] = [];
+  const forms = await menu.locator("li label.checkbox").evaluateAll((labels) =>
+    labels
+      .map((label) => {
+        const input = label.querySelector("input[type='checkbox']");
+        const formId = input?.getAttribute("value") ?? "";
+        const name = label.textContent?.replace(/\s+/g, " ").trim() ?? "";
 
-  for (const item of items) {
-    const input = await item.$("input[type='checkbox']");
-    if (!input) {
-      continue;
-    }
+        if (!formId || Number.isNaN(Number(formId))) {
+          return null;
+        }
 
-    const formId = await input.getAttribute("value");
-    const label = (await item.innerText()).trim();
-    if (!formId || Number.isNaN(Number(formId))) {
-      continue;
-    }
+        return { id: formId, name };
+      })
+      .filter((item): item is { id: string; name: string } => item !== null)
+  );
 
-    forms.push({ id: formId, name: label });
+  await dropdown.click();
+  return forms;
+}
+
+export async function extractResourcePlaces(page: Page): Promise<ResourcePlace[]> {
+  await page
+    .locator(SELECTORS.reportResourcePlaceContainer)
+    .waitFor({ state: "attached", timeout: TIMEOUTS.navigation })
+    .catch(() => undefined);
+
+  const select = page.locator(SELECTORS.reportResourcePlaceSelect).first();
+  await select.waitFor({ state: "attached", timeout: TIMEOUTS.navigation });
+
+  const hasOptions = await waitForResourcePlaceOptions(page);
+
+  if (hasOptions) {
+    return select.locator("option").evaluateAll((options) =>
+      options
+        .map((option) => {
+          const value = option.getAttribute("value")?.trim() ?? "";
+          const name = option.textContent?.replace(/\s+/g, " ").trim() ?? "";
+
+          if (!value || Number.isNaN(Number(value)) || !name) {
+            return null;
+          }
+
+          return { id: value, name };
+        })
+        .filter((item): item is { id: string; name: string } => item !== null)
+    );
   }
 
-  await page.click(SELECTORS.reportFormDropdown);
-  return forms;
+  const dropdown = page.locator(SELECTORS.reportResourcePlaceDropdown).first();
+  if ((await dropdown.count()) === 0) {
+    return [];
+  }
+
+  await dropdown.click();
+  await closeOnboardingPopup(page);
+  const hasOptionsAfterOpen = await waitForResourcePlaceOptions(page);
+
+  if (hasOptionsAfterOpen) {
+    const resourcePlaces = await select.locator("option").evaluateAll((options) =>
+      options
+        .map((option) => {
+          const value = option.getAttribute("value")?.trim() ?? "";
+          const name = option.textContent?.replace(/\s+/g, " ").trim() ?? "";
+
+          if (!value || Number.isNaN(Number(value)) || !name) {
+            return null;
+          }
+
+          return { id: value, name };
+        })
+        .filter((item): item is { id: string; name: string } => item !== null)
+    );
+
+    await dropdown.click().catch(() => undefined);
+    return resourcePlaces;
+  }
+
+  const menu = dropdown
+    .locator("xpath=following::ul[contains(@class, 'multiselect-container')][1]")
+    .first();
+  await menu.waitFor({ state: "visible", timeout: TIMEOUTS.navigation }).catch(() => undefined);
+
+  const resourcePlaces = await menu.locator("li label.checkbox").evaluateAll((labels) =>
+    labels
+      .map((label) => {
+        const input = label.querySelector("input[type='checkbox']");
+        const value = input?.getAttribute("value")?.trim() ?? "";
+        const name = label.textContent?.replace(/\s+/g, " ").trim() ?? "";
+
+        if (!value || Number.isNaN(Number(value)) || !name) {
+          return null;
+        }
+
+        return { id: value, name };
+      })
+      .filter((item): item is { id: string; name: string } => item !== null)
+  );
+
+  await dropdown.click().catch(() => undefined);
+  return resourcePlaces;
 }
 
 export async function extractTotalReports(page: Page): Promise<ReportTotals> {
@@ -172,61 +284,67 @@ export async function extractRawRowsFromCurrentPage(
   await waitForReportTable(page);
 
   return page.evaluate((selectors) => {
-    const headers = Array.from(
-      document.querySelectorAll(selectors.reportHeaders)
-    ).map((node) => node.textContent?.trim() ?? "");
+    const rows = Array.from(document.querySelectorAll(".formFill-card table")).flatMap(
+      (table) => {
+        const headers = Array.from(table.querySelectorAll("thead th")).map(
+          (node) => node.textContent?.trim() ?? ""
+        );
 
-    return Array.from(document.querySelectorAll(selectors.reportRows)).map(
-      (row, rowIndex) => {
-        const cells = Array.from(row.querySelectorAll("td")).map((cell, index) => ({
-          header: headers[index] ?? `column_${index + 1}`,
-          text: cell.textContent?.replace(/\s+/g, " ").trim() ?? "",
-        }));
+        return Array.from(table.querySelectorAll("tbody tr")).map((row) => {
+          const cells = Array.from(row.querySelectorAll("td")).map((cell, index) => ({
+            header: headers[index] ?? `column_${index + 1}`,
+            text: cell.textContent?.replace(/\s+/g, " ").trim() ?? "",
+          }));
 
-        const actions = Array.from(
-          row.querySelectorAll(
-            "a, button, input[type='button'], input[type='submit']"
-          )
-        ).map((element) => {
-          const dataset: Record<string, string> = {};
-          Object.entries((element as HTMLElement).dataset ?? {}).forEach(
+          const actions = Array.from(
+            row.querySelectorAll(
+              "a, button, input[type='button'], input[type='submit']"
+            )
+          ).map((element) => {
+            const dataset: Record<string, string> = {};
+            Object.entries((element as HTMLElement).dataset ?? {}).forEach(
+              ([key, value]) => {
+                if (typeof value === "string") {
+                  dataset[key] = value;
+                }
+              }
+            );
+
+            return {
+              id: (element as HTMLElement).id || null,
+              text: element.textContent?.replace(/\s+/g, " ").trim() ?? "",
+              href: element instanceof HTMLAnchorElement ? element.href : null,
+              dataset,
+            };
+          });
+
+          const rowDataset: Record<string, string> = {};
+          Object.entries((row as HTMLElement).dataset ?? {}).forEach(
             ([key, value]) => {
               if (typeof value === "string") {
-                dataset[key] = value;
+                rowDataset[key] = value;
               }
             }
           );
 
           return {
-            id: (element as HTMLElement).id || null,
-            text: element.textContent?.replace(/\s+/g, " ").trim() ?? "",
-            href: element instanceof HTMLAnchorElement ? element.href : null,
-            dataset,
+            rowText: row.textContent?.replace(/\s+/g, " ").trim() ?? "",
+            rowHtml: row.outerHTML,
+            rowDataset,
+            cells,
+            actions,
+            links: Array.from(row.querySelectorAll("a"))
+              .map((anchor) => anchor.href)
+              .filter(Boolean),
           };
         });
-
-        const rowDataset: Record<string, string> = {};
-        Object.entries((row as HTMLElement).dataset ?? {}).forEach(
-          ([key, value]) => {
-            if (typeof value === "string") {
-              rowDataset[key] = value;
-            }
-          }
-        );
-
-        return {
-          rowIndex: rowIndex + 1,
-          rowText: row.textContent?.replace(/\s+/g, " ").trim() ?? "",
-          rowHtml: row.outerHTML,
-          rowDataset,
-          cells,
-          actions,
-          links: Array.from(row.querySelectorAll("a"))
-            .map((anchor) => anchor.href)
-            .filter(Boolean),
-        };
       }
     );
+
+    return rows.map((row, rowIndex) => ({
+      rowIndex: rowIndex + 1,
+      ...row,
+    }));
   }, SELECTORS);
 }
 

@@ -14,6 +14,11 @@ export const SELECTORS = {
   reportsMenuLink: 'a[href="/form_fills"]',
   reportFormDropdown: ".multiselect-option .multiselect.dropdown-toggle",
   reportFormOptions: ".multiselect-container li label.checkbox",
+  reportResourcePlaceSelect:
+    '#formFill-resourcePlace, select[name="form_fill[resource_place_ids][]"]',
+  reportResourcePlaceContainer: "#formFill-resourcePlace-container",
+  reportResourcePlaceDropdown:
+    '#formFill-resourcePlace-container .multiselect.dropdown-toggle, #formFill-resourcePlace-container button.multiselect',
   reportRows: ".formFill-card table tbody tr",
   reportHeaders: ".formFill-card table thead th",
   paginationLinks: ".pagination a",

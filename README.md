@@ -113,6 +113,9 @@ Quando `true`, pula o planning e retoma a execucao diretamente do `execution-sta
 `MAX_RETRIES`
 Limite de tentativas por item.
 
+`PLANNING_CONCURRENCY`
+Quantidade maxima de escopos processados em paralelo na fase de planning.
+
 `DOWNLOAD_CONCURRENCY`
 Quantidade maxima de workers de download.
 

@@ -41,6 +41,10 @@ export const config = {
     extractionPlanFile: process.env.EXTRACTION_PLAN_FILE ?? "",
     resumeFromControl: parseBoolean(process.env.RESUME_FROM_CONTROL, false),
     maxRetries: parseNumber(process.env.MAX_RETRIES, 3),
+    planningConcurrency: Math.max(
+      1,
+      parseNumber(process.env.PLANNING_CONCURRENCY, 1)
+    ),
     downloadConcurrency: Math.max(
       1,
       parseNumber(process.env.DOWNLOAD_CONCURRENCY, 1)

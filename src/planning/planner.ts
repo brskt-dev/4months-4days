@@ -16,6 +16,7 @@ import {
   PlanningFailure,
   ScopePlanningSummary,
 } from "../types";
+import { mapWithConcurrency } from "../utils/concurrency";
 import { nowIso } from "../utils/dates";
 import { fileExists, readJsonFile } from "../utils/filesystem";
 import {
@@ -123,6 +124,159 @@ async function resolveExtractionScopes(
   return autoScopes;
 }
 
+async function processScopePlanning(
+  page: Page,
+  scope: ExtractionScope,
+  runId: string,
+  logger: RunLogger
+): Promise<{
+  items: PlannedReportItem[];
+  failures: PlanningFailure[];
+  summary: ScopePlanningSummary;
+}> {
+  await logger.info("planning", "Aplicando escopo de planejamento.", {
+    scopeId: scope.scopeId,
+    scopeLabel: scope.scopeLabel,
+  });
+
+  const sourceUrl = await applyFilters(page, {
+    formId: scope.formId,
+    localId: scope.localId,
+    assetId: scope.assetId,
+    startDate: scope.startDate,
+    endDate: scope.endDate,
+    extraQueryParams: scope.extraQueryParams,
+  });
+
+  await closeOnboardingPopup(page);
+
+  const totals = await extractTotalReports(page);
+  let extractedRows = 0;
+  const inconsistencies: string[] = [];
+  const items: PlannedReportItem[] = [];
+  const failures: PlanningFailure[] = [];
+
+  for (let pageIndex = 1; pageIndex <= totals.totalPages; pageIndex++) {
+    const pageUrl = withPage(sourceUrl, pageIndex);
+    await page.goto(pageUrl, { waitUntil: "networkidle" });
+    await closeOnboardingPopup(page);
+
+    const rows = await extractRawRowsFromCurrentPage(page);
+    extractedRows += rows.length;
+
+    for (const row of rows) {
+      const reportId = extractReportIdFromRow(row);
+      const reportDateInfo = extractReportDateFromRow(row);
+
+      if (!reportId) {
+        failures.push({
+          scopeId: scope.scopeId,
+          sourcePage: pageIndex,
+          sourceRowIndex: row.rowIndex,
+          rowText: row.rowText,
+          reason: "Nao foi possivel identificar o report_id da linha.",
+          discoveredAt: nowIso(),
+        });
+        continue;
+      }
+
+      if (!reportDateInfo) {
+        failures.push({
+          scopeId: scope.scopeId,
+          sourcePage: pageIndex,
+          sourceRowIndex: row.rowIndex,
+          rowText: row.rowText,
+          reason: `Nao foi possivel identificar a data do relatorio para ${reportId}.`,
+          discoveredAt: nowIso(),
+        });
+        continue;
+      }
+
+      const formName =
+        extractFormNameFromRow(row) ??
+        scope.formName ??
+        scope.formId ??
+        "UnknownForm";
+      const localName =
+        extractLocalNameFromRow(row) ??
+        scope.localName ??
+        scope.localId ??
+        extractAssetNameFromRow(row) ??
+        scope.assetName ??
+        scope.assetId ??
+        "UnknownLocal";
+      const assetName =
+        extractAssetNameFromRow(row) ?? scope.assetName ?? scope.assetId ?? null;
+      const plannedPath = buildPlannedPath(
+        formName,
+        localName,
+        reportDateInfo.year,
+        reportId
+      );
+      const filterTrace = {
+        scopeId: scope.scopeId,
+        scopeLabel: scope.scopeLabel,
+        formId: scope.formId ?? null,
+        localId: scope.localId ?? null,
+        assetId: scope.assetId ?? null,
+        startDate: scope.startDate,
+        endDate: scope.endDate,
+        sourceUrl: pageUrl,
+      };
+
+      items.push({
+        reportId,
+        formName,
+        localName,
+        assetName,
+        reportDate: reportDateInfo.iso,
+        reportDateRaw: reportDateInfo.raw,
+        year: reportDateInfo.year,
+        sourcePage: pageIndex,
+        sourceRowIndex: row.rowIndex,
+        sourceUrl: pageUrl,
+        exportButtonId: extractExportButtonId(row),
+        rowText: row.rowText,
+        rowHtml: row.rowHtml,
+        rowDataset: row.rowDataset,
+        filterFormId: scope.formId ?? null,
+        filterLocalId: scope.localId ?? null,
+        filterAssetId: scope.assetId ?? null,
+        filterStartDate: scope.startDate,
+        filterEndDate: scope.endDate,
+        plannedFolder: plannedPath.folder,
+        plannedFilename: plannedPath.filename,
+        plannedPath: plannedPath.fullPath,
+        discoveredAt: nowIso(),
+        discoveredInRunId: runId,
+        filterTrace: [filterTrace],
+      });
+    }
+  }
+
+  if (totals.totalReports !== extractedRows) {
+    inconsistencies.push(
+      `Esperado ${totals.totalReports} itens, mas ${extractedRows} linhas foram extraidas.`
+    );
+  }
+
+  return {
+    items,
+    failures,
+    summary: {
+      scopeId: scope.scopeId,
+      scopeLabel: scope.scopeLabel,
+      sourceUrl,
+      expectedTotalReports: totals.totalReports,
+      extractedRows,
+      totalPages: totals.totalPages,
+      reportsPerPage: totals.reportsPerPage,
+      lastPageCount: totals.lastPageCount,
+      inconsistencies,
+    },
+  };
+}
+
 export async function planReportInventory(
   page: Page,
   runId: string,
@@ -137,162 +291,53 @@ export async function planReportInventory(
   const uniqueItems = new Map<string, PlannedReportItem>();
   const planningFailures: PlanningFailure[] = [];
   const scopeSummaries: ScopePlanningSummary[] = [];
+  const planningConcurrency = Math.min(
+    scopes.length || 1,
+    config.execution.planningConcurrency
+  );
 
-  for (const scope of scopes) {
-    await logger.info("planning", "Aplicando escopo de planejamento.", {
-      scopeId: scope.scopeId,
-      scopeLabel: scope.scopeLabel,
-    });
+  await logger.info("planning", "Iniciando processamento paralelo dos escopos.", {
+    scopes: scopes.length,
+    planningConcurrency,
+  });
 
-    const sourceUrl = await applyFilters(page, {
-      formId: scope.formId,
-      localId: scope.localId,
-      assetId: scope.assetId,
-      startDate: scope.startDate,
-      endDate: scope.endDate,
-      extraQueryParams: scope.extraQueryParams,
-    });
+  const scopeResults = await mapWithConcurrency(
+    scopes,
+    planningConcurrency,
+    async (scope) => {
+      const scopePage = await page.context().newPage();
 
-    await closeOnboardingPopup(page);
-
-    const totals = await extractTotalReports(page);
-    let extractedRows = 0;
-    const inconsistencies: string[] = [];
-
-    for (let pageIndex = 1; pageIndex <= totals.totalPages; pageIndex++) {
-      const pageUrl = withPage(sourceUrl, pageIndex);
-      await page.goto(pageUrl, { waitUntil: "networkidle" });
-      await closeOnboardingPopup(page);
-
-      const rows = await extractRawRowsFromCurrentPage(page);
-      extractedRows += rows.length;
-
-      for (const row of rows) {
-        const reportId = extractReportIdFromRow(row);
-        const reportDateInfo = extractReportDateFromRow(row);
-
-        if (!reportId) {
-          planningFailures.push({
-            scopeId: scope.scopeId,
-            sourcePage: pageIndex,
-            sourceRowIndex: row.rowIndex,
-            rowText: row.rowText,
-            reason: "Nao foi possivel identificar o report_id da linha.",
-            discoveredAt: nowIso(),
-          });
-          continue;
-        }
-
-        if (!reportDateInfo) {
-          planningFailures.push({
-            scopeId: scope.scopeId,
-            sourcePage: pageIndex,
-            sourceRowIndex: row.rowIndex,
-            rowText: row.rowText,
-            reason: `Nao foi possivel identificar a data do relatorio para ${reportId}.`,
-            discoveredAt: nowIso(),
-          });
-          continue;
-        }
-
-        const formName =
-          extractFormNameFromRow(row) ??
-          scope.formName ??
-          scope.formId ??
-          "UnknownForm";
-        const localName =
-          extractLocalNameFromRow(row) ??
-          scope.localName ??
-          scope.localId ??
-          extractAssetNameFromRow(row) ??
-          scope.assetName ??
-          scope.assetId ??
-          "UnknownLocal";
-        const assetName =
-          extractAssetNameFromRow(row) ?? scope.assetName ?? scope.assetId ?? null;
-        const plannedPath = buildPlannedPath(
-          formName,
-          localName,
-          reportDateInfo.year,
-          reportId
-        );
-        const filterTrace = {
-          scopeId: scope.scopeId,
-          scopeLabel: scope.scopeLabel,
-          formId: scope.formId ?? null,
-          localId: scope.localId ?? null,
-          assetId: scope.assetId ?? null,
-          startDate: scope.startDate,
-          endDate: scope.endDate,
-          sourceUrl: pageUrl,
-        };
-
-        const existing = uniqueItems.get(reportId);
-        if (existing) {
-          if (
-            !existing.filterTrace.some(
-              (trace) => trace.scopeId === filterTrace.scopeId
-            )
-          ) {
-            existing.filterTrace.push(filterTrace);
-          }
-
-          if (existing.plannedPath !== plannedPath.fullPath) {
-            inconsistencies.push(
-              `Report ${reportId} apareceu com destino divergente: ${existing.plannedPath} vs ${plannedPath.fullPath}.`
-            );
-          }
-
-          continue;
-        }
-
-        uniqueItems.set(reportId, {
-          reportId,
-          formName,
-          localName,
-          assetName,
-          reportDate: reportDateInfo.iso,
-          reportDateRaw: reportDateInfo.raw,
-          year: reportDateInfo.year,
-          sourcePage: pageIndex,
-          sourceRowIndex: row.rowIndex,
-          sourceUrl: pageUrl,
-          exportButtonId: extractExportButtonId(row),
-          rowText: row.rowText,
-          rowHtml: row.rowHtml,
-          rowDataset: row.rowDataset,
-          filterFormId: scope.formId ?? null,
-          filterLocalId: scope.localId ?? null,
-          filterAssetId: scope.assetId ?? null,
-          filterStartDate: scope.startDate,
-          filterEndDate: scope.endDate,
-          plannedFolder: plannedPath.folder,
-          plannedFilename: plannedPath.filename,
-          plannedPath: plannedPath.fullPath,
-          discoveredAt: nowIso(),
-          discoveredInRunId: runId,
-          filterTrace: [filterTrace],
-        });
+      try {
+        return await processScopePlanning(scopePage, scope, runId, logger);
+      } finally {
+        await scopePage.close().catch(() => undefined);
       }
     }
+  );
 
-    if (totals.totalReports !== extractedRows) {
-      inconsistencies.push(
-        `Esperado ${totals.totalReports} itens, mas ${extractedRows} linhas foram extraidas.`
-      );
+  for (const result of scopeResults) {
+    planningFailures.push(...result.failures);
+    scopeSummaries.push(result.summary);
+
+    for (const item of result.items) {
+      const existing = uniqueItems.get(item.reportId);
+      if (existing) {
+        const trace = item.filterTrace[0];
+        if (!existing.filterTrace.some((entry) => entry.scopeId === trace.scopeId)) {
+          existing.filterTrace.push(trace);
+        }
+
+        if (existing.plannedPath !== item.plannedPath) {
+          result.summary.inconsistencies.push(
+            `Report ${item.reportId} apareceu com destino divergente: ${existing.plannedPath} vs ${item.plannedPath}.`
+          );
+        }
+
+        continue;
+      }
+
+      uniqueItems.set(item.reportId, item);
     }
-
-    scopeSummaries.push({
-      scopeId: scope.scopeId,
-      scopeLabel: scope.scopeLabel,
-      sourceUrl,
-      expectedTotalReports: totals.totalReports,
-      extractedRows,
-      totalPages: totals.totalPages,
-      reportsPerPage: totals.reportsPerPage,
-      lastPageCount: totals.lastPageCount,
-      inconsistencies,
-    });
   }
 
   return {

@@ -1,42 +1,45 @@
 import { Page } from "playwright";
+import { buildAppUrl } from "../config";
+import { ROUTES, SELECTORS } from "../constants";
 import { closeOnboardingPopup } from "./closePopup";
 
-export async function fillReport(page: Page, workId: number): Promise<void> {
-  console.log(`➡️ Abrindo atividade ${workId}...`);
-  await page.goto(`https://app.produttivo.com.br/works/${workId}`, {
+export async function fillReport(
+  page: Page,
+  workId: number,
+  answerText: string
+): Promise<void> {
+  console.log(`Abrindo atividade ${workId}...`);
+  await page.goto(buildAppUrl(`${ROUTES.works}/${workId}`), {
     waitUntil: "domcontentloaded",
   });
 
   await closeOnboardingPopup(page);
 
-  console.log("➡️ Criando novo preenchimento...");
-  await page.waitForSelector('a[href*="/form_fills/new"]');
+  console.log("Criando novo preenchimento...");
+  await page.waitForSelector(SELECTORS.newFillLink);
 
   await Promise.all([
     page.waitForURL("**/form_fills/**/edit*"),
-    page.click('a[href*="/form_fills/new"]'),
+    page.click(SELECTORS.newFillLink),
   ]);
 
-  console.log("➡️ Tela de edição carregada.");
+  console.log("Tela de edicao carregada.");
   await closeOnboardingPopup(page);
 
-  console.log("➡️ Abrindo modal...");
-  await page.click(".edit-field-value-button");
+  console.log("Abrindo modal...");
+  await page.click(SELECTORS.editFieldButton);
   await page.waitForSelector(".modal-dialog");
 
-  console.log("➡️ Preenchendo resposta...");
-  await page.fill("#fieldValueValue", "Resposta automática gerada pelo bot");
+  console.log("Preenchendo resposta...");
+  await page.fill(SELECTORS.fieldValueInput, answerText);
 
-  console.log("➡️ Salvando...");
-  await page.click("#saveFieldValueButton");
-
-  // Modal some rápido, evitar traps
+  console.log("Salvando...");
+  await page.click(SELECTORS.saveFieldValueButton);
   await page.waitForTimeout(150);
 
-  console.log("➡️ Recarregando página para novo preenchimento...");
+  console.log("Recarregando pagina para novo preenchimento...");
   await page.reload({ waitUntil: "domcontentloaded" });
-
   await closeOnboardingPopup(page);
 
-  console.log("✅ Preenchimento finalizado!");
+  console.log("Preenchimento finalizado.");
 }

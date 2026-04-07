@@ -1,0 +1,23 @@
+{
+  "scopes": [
+    {
+      "scopeLabel": "Form A - Local 10 - Historico",
+      "formId": "123456",
+      "formName": "Form A",
+      "localId": "7890",
+      "localName": "Local 10",
+      "startDate": "01/01/2024",
+      "endDate": "31/12/2025"
+    },
+    {
+      "scopeLabel": "Form B - Todos os Locais",
+      "formId": "654321",
+      "formName": "Form B",
+      "startDate": "01/01/2020",
+      "endDate": "31/12/2025",
+      "extraQueryParams": {
+        "order_type": "desc"
+      }
+    }
+  ]
+}

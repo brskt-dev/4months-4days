@@ -18,6 +18,15 @@ async function loginIntoPage(page: Page): Promise<void> {
 export async function performLogin(): Promise<Page> {
   const browser = await chromium.launch({ headless: config.browserHeadless });
   const context = await browser.newContext({ acceptDownloads: true });
+  await context.route("**/*", async (route) => {
+    const resourceType = route.request().resourceType();
+    if (resourceType === "image" || resourceType === "media" || resourceType === "font") {
+      await route.abort();
+      return;
+    }
+
+    await route.continue();
+  });
   const page = await context.newPage();
 
   await loginIntoPage(page);
@@ -45,14 +54,14 @@ export async function ensureAuthenticatedPage(
   targetUrl?: string
 ): Promise<Page> {
   if (targetUrl) {
-    await page.goto(targetUrl, { waitUntil: "networkidle" });
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
   }
 
   if (await isAuthenticationRequired(page)) {
     console.warn("Sessao expirada detectada. Reautenticando...");
     await loginIntoPage(page);
     if (targetUrl) {
-      await page.goto(targetUrl, { waitUntil: "networkidle" });
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
     }
   }
 

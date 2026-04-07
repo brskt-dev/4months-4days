@@ -314,6 +314,13 @@ async function processScopePlanning(
     pageRange: options?.pageRange ?? null,
   });
 
+  const scopeStartedAt = Date.now();
+  let pageNavigationMs = 0;
+  let popupHandlingMs = 0;
+  let rowExtractionMs = 0;
+  let rowProcessingMs = 0;
+  let pagesVisited = 0;
+
   const sourceUrl =
     options?.precomputedSourceUrl ??
     (await applyFilters(page, {
@@ -325,9 +332,14 @@ async function processScopePlanning(
       extraQueryParams: scope.extraQueryParams,
     }));
 
+  const popupAfterFiltersStartedAt = Date.now();
   await closeOnboardingPopup(page);
+  popupHandlingMs += Date.now() - popupAfterFiltersStartedAt;
 
+  const totalsInspectionStartedAt = Date.now();
   const totals = options?.precomputedTotals ?? (await extractTotalReports(page));
+  const totalsInspectionMs =
+    options?.precomputedTotals ? 0 : Date.now() - totalsInspectionStartedAt;
   let extractedRows = 0;
   const inconsistencies: string[] = [];
   const items: PlannedReportItem[] = [];
@@ -338,12 +350,21 @@ async function processScopePlanning(
 
   for (let pageIndex = startPage; pageIndex <= endPage && !stopEarly; pageIndex++) {
     const pageUrl = withPage(sourceUrl, pageIndex);
-    await page.goto(pageUrl, { waitUntil: "networkidle" });
+    const navigationStartedAt = Date.now();
+    await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
+    pageNavigationMs += Date.now() - navigationStartedAt;
+
+    const popupAfterNavigationStartedAt = Date.now();
     await closeOnboardingPopup(page);
+    popupHandlingMs += Date.now() - popupAfterNavigationStartedAt;
 
+    const rowExtractionStartedAt = Date.now();
     const rows = await extractRawRowsFromCurrentPage(page);
+    rowExtractionMs += Date.now() - rowExtractionStartedAt;
     extractedRows += rows.length;
+    pagesVisited += 1;
 
+    const rowProcessingStartedAt = Date.now();
     for (const row of rows) {
       const reportId = extractReportIdFromRow(row);
       const reportDateInfo = extractReportDateFromRow(row) ?? buildUnknownDateInfo();
@@ -429,6 +450,7 @@ async function processScopePlanning(
         break;
       }
     }
+    rowProcessingMs += Date.now() - rowProcessingStartedAt;
   }
 
   if (stopEarly) {
@@ -443,20 +465,54 @@ async function processScopePlanning(
     );
   }
 
+  const summary: ScopePlanningSummary = {
+    scopeId: scope.scopeId,
+    scopeLabel: scope.scopeLabel,
+    sourceUrl,
+    expectedTotalReports: totals.totalReports,
+    extractedRows,
+    totalPages: totals.totalPages,
+    reportsPerPage: totals.reportsPerPage,
+    lastPageCount: totals.lastPageCount,
+    inconsistencies,
+    telemetry: {
+      totalsInspectionMs,
+      pageNavigationMs,
+      tableWaitMs: 0,
+      rowExtractionMs,
+      rowProcessingMs,
+      totalScopeMs: Date.now() - scopeStartedAt,
+      pagesVisited,
+    },
+  };
+
+  await logger.info("planning", "Telemetria do escopo de planejamento.", {
+    scopeId: scope.scopeId,
+    scopeLabel: scope.scopeLabel,
+    expectedTotalReports: totals.totalReports,
+    extractedRows,
+    totalPages: totals.totalPages,
+    pagesVisited,
+    totalsInspectionMs,
+    pageNavigationMs,
+    popupHandlingMs,
+    rowExtractionMs,
+    rowProcessingMs,
+    totalScopeMs: summary.telemetry?.totalScopeMs ?? null,
+    avgNavigationMsPerPage:
+      pagesVisited > 0 ? Math.round(pageNavigationMs / pagesVisited) : 0,
+    avgPopupHandlingMsPerPage:
+      pagesVisited > 0 ? Math.round(popupHandlingMs / (pagesVisited + 1)) : popupHandlingMs,
+    avgRowExtractionMsPerPage:
+      pagesVisited > 0 ? Math.round(rowExtractionMs / pagesVisited) : 0,
+    avgRowProcessingMsPerPage:
+      pagesVisited > 0 ? Math.round(rowProcessingMs / pagesVisited) : 0,
+  });
+
   return {
     items,
     failures,
-    summary: {
-      scopeId: scope.scopeId,
-      scopeLabel: scope.scopeLabel,
-      sourceUrl,
-      expectedTotalReports: totals.totalReports,
-      extractedRows,
-      totalPages: totals.totalPages,
-      reportsPerPage: totals.reportsPerPage,
-      lastPageCount: totals.lastPageCount,
-      inconsistencies,
-    },
+    summary,
   };
 }
 

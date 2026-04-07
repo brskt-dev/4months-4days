@@ -186,6 +186,15 @@ export type ScopePlanningSummary = {
   reportsPerPage: number;
   lastPageCount: number;
   inconsistencies: string[];
+  telemetry?: {
+    totalsInspectionMs: number;
+    pageNavigationMs: number;
+    tableWaitMs: number;
+    rowExtractionMs: number;
+    rowProcessingMs: number;
+    totalScopeMs: number;
+    pagesVisited: number;
+  };
 };
 
 export type RunArtifacts = {

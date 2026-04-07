@@ -1,11 +1,16 @@
 import { Page } from "playwright";
-import { TIMEOUTS } from "../constants";
 
 export async function closeOnboardingPopup(page: Page): Promise<void> {
   try {
-    await page.waitForSelector("#popupOnboardingStepsOpened", {
-      timeout: TIMEOUTS.popup,
-    });
+    const popup = page.locator("#popupOnboardingStepsOpened").first();
+    if ((await popup.count()) === 0) {
+      return;
+    }
+
+    const isVisible = await popup.isVisible().catch(() => false);
+    if (!isVisible) {
+      return;
+    }
 
     console.log("Popup de onboarding encontrado; escondendo...");
 

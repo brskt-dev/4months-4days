@@ -41,7 +41,6 @@ async function waitForResourcePlaceOptions(page: Page): Promise<boolean> {
 }
 
 async function waitForReportTable(page: Page): Promise<void> {
-  await page.waitForTimeout(500);
   await page
     .waitForSelector(SELECTORS.reportRows, {
       timeout: TIMEOUTS.short,
@@ -129,7 +128,7 @@ export async function applyFilters(
 ): Promise<string> {
   const targetUrl = buildReportsUrl(filters);
   await closeOnboardingPopup(page);
-  await page.goto(targetUrl, { waitUntil: "networkidle" });
+  await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
   await closeOnboardingPopup(page);
   await waitForReportTable(page);
   return targetUrl;
@@ -260,14 +259,14 @@ export async function extractTotalReports(page: Page): Promise<ReportTotals> {
 
   if (totalPages > 1) {
     await page.goto(withPage(filteredUrl, totalPages), {
-      waitUntil: "networkidle",
+      waitUntil: "domcontentloaded",
     });
     await waitForReportTable(page);
     lastPageCount = await page.locator(SELECTORS.reportRows).count();
     totalReports = rowsCount * (totalPages - 1) + lastPageCount;
   }
 
-  await page.goto(withPage(filteredUrl, 1), { waitUntil: "networkidle" });
+  await page.goto(withPage(filteredUrl, 1), { waitUntil: "domcontentloaded" });
   await waitForReportTable(page);
 
   return {

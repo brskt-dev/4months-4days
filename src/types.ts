@@ -207,6 +207,16 @@ export type RunArtifacts = {
   filtersProcessed: ScopePlanningSummary[];
 };
 
+export type PlanningCheckpoint = {
+  version: number;
+  updatedAt: string;
+  scopeSignature: string;
+  completedScopeIds: string[];
+  plannedItems: PlannedReportItem[];
+  planningFailures: PlanningFailure[];
+  scopeSummaries: ScopePlanningSummary[];
+};
+
 export type SummaryBucket = {
   key: string;
   planned: number;

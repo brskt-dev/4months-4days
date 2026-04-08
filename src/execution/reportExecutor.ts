@@ -3,6 +3,7 @@ import { config } from "../config";
 import { closeOnboardingPopup } from "../helpers/closePopup";
 import { RunLogger } from "../logging/runLogger";
 import { ensureAuthenticatedPage } from "../login";
+import { isShutdownRequested } from "../runtime/shutdown";
 import {
   exportReportPdf,
   findExportSelectorForReport,
@@ -447,6 +448,10 @@ export async function processExecutionQueue(
     pages.map(async (page) => {
       while (true) {
         if (fatalError) {
+          break;
+        }
+
+        if (isShutdownRequested()) {
           break;
         }
 

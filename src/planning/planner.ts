@@ -2,9 +2,11 @@ import { Page } from "playwright";
 import { config } from "../config";
 import { closeOnboardingPopup } from "../helpers/closePopup";
 import { RunLogger } from "../logging/runLogger";
+import { isShutdownRequested } from "../runtime/shutdown";
 import {
   applyFilters,
   extractFormTypes,
+  extractPlanningPagination,
   extractResourcePlaces,
   extractRawRowsFromCurrentPage,
   extractTotalReports,
@@ -13,13 +15,18 @@ import {
   ExtractionPlanFile,
   ExtractionScope,
   FormType,
+  PlanningCheckpoint,
   PlannedReportItem,
   PlanningFailure,
   ReportTotals,
   ResourcePlace,
   ScopePlanningSummary,
 } from "../types";
-import { mapWithConcurrency } from "../utils/concurrency";
+import {
+  clearPlanningCheckpoint,
+  loadPlanningCheckpoint,
+  savePlanningCheckpoint,
+} from "../storage/planningCheckpointStore";
 import { nowIso } from "../utils/dates";
 import { fileExists, readJsonFile } from "../utils/filesystem";
 import {
@@ -36,6 +43,7 @@ import { buildScopeId } from "../utils/sanitize";
 const UNKNOWN_YEAR = "UnknownYear";
 const UNKNOWN_FORM = "UnknownForm";
 const EXTRA_ORPHAN_PREFIX = ["Extra"];
+const PLANNING_CHECKPOINT_VERSION = 1;
 
 function buildUnknownDateInfo() {
   return {
@@ -245,6 +253,74 @@ function buildItemLocalKey(
   return item.filterLocalId ?? item.localName ?? "all-locals";
 }
 
+function buildScopeSignature(scopes: ExtractionScope[]): string {
+  return JSON.stringify(
+    scopes.map((scope) => ({
+      scopeId: scope.scopeId,
+      scopeLabel: scope.scopeLabel,
+      formId: scope.formId ?? null,
+      localId: scope.localId ?? null,
+      assetId: scope.assetId ?? null,
+      startDate: scope.startDate,
+      endDate: scope.endDate,
+      extraQueryParams: scope.extraQueryParams ?? null,
+    }))
+  );
+}
+
+function createEmptyPlanningCheckpoint(
+  scopeSignature: string
+): PlanningCheckpoint {
+  return {
+    version: PLANNING_CHECKPOINT_VERSION,
+    updatedAt: "",
+    scopeSignature,
+    completedScopeIds: [],
+    plannedItems: [],
+    planningFailures: [],
+    scopeSummaries: [],
+  };
+}
+
+function mergePlanningResult(
+  uniqueItems: Map<string, PlannedReportItem>,
+  planningFailures: PlanningFailure[],
+  scopeSummaries: ScopePlanningSummary[],
+  result: {
+    items: PlannedReportItem[];
+    failures: PlanningFailure[];
+    summary: ScopePlanningSummary;
+  }
+): void {
+  planningFailures.push(...result.failures);
+  scopeSummaries.push(result.summary);
+
+  for (const item of result.items) {
+    const existing = uniqueItems.get(item.reportId);
+    if (existing) {
+      const trace = item.filterTrace[0];
+      if (!existing.filterTrace.some((entry) => entry.scopeId === trace.scopeId)) {
+        existing.filterTrace.push(trace);
+      }
+
+      if (existing.plannedPath !== item.plannedPath) {
+        result.summary.inconsistencies.push(
+          `Report ${item.reportId} apareceu com destino divergente: ${existing.plannedPath} vs ${item.plannedPath}.`
+        );
+
+        if (getPlanningSpecificity(item) > getPlanningSpecificity(existing)) {
+          item.filterTrace = existing.filterTrace;
+          uniqueItems.set(item.reportId, item);
+        }
+      }
+
+      continue;
+    }
+
+    uniqueItems.set(item.reportId, item);
+  }
+}
+
 function buildPageRanges(
   totalPages: number,
   maxWorkers: number
@@ -337,7 +413,8 @@ async function processScopePlanning(
   popupHandlingMs += Date.now() - popupAfterFiltersStartedAt;
 
   const totalsInspectionStartedAt = Date.now();
-  const totals = options?.precomputedTotals ?? (await extractTotalReports(page));
+  const planningPagination =
+    options?.precomputedTotals ?? (await extractPlanningPagination(page));
   const totalsInspectionMs =
     options?.precomputedTotals ? 0 : Date.now() - totalsInspectionStartedAt;
   let extractedRows = 0;
@@ -346,7 +423,8 @@ async function processScopePlanning(
   const failures: PlanningFailure[] = [];
   let stopEarly = false;
   const startPage = options?.pageRange?.start ?? 1;
-  const endPage = options?.pageRange?.end ?? totals.totalPages;
+  const endPage = options?.pageRange?.end ?? planningPagination.totalPages;
+  let lastProcessedPageRowCount = 0;
 
   for (let pageIndex = startPage; pageIndex <= endPage && !stopEarly; pageIndex++) {
     const pageUrl = withPage(sourceUrl, pageIndex);
@@ -363,6 +441,7 @@ async function processScopePlanning(
     rowExtractionMs += Date.now() - rowExtractionStartedAt;
     extractedRows += rows.length;
     pagesVisited += 1;
+    lastProcessedPageRowCount = rows.length;
 
     const rowProcessingStartedAt = Date.now();
     for (const row of rows) {
@@ -453,15 +532,22 @@ async function processScopePlanning(
     rowProcessingMs += Date.now() - rowProcessingStartedAt;
   }
 
+  const summaryTotals: ReportTotals = options?.precomputedTotals ?? {
+    reportsPerPage: planningPagination.reportsPerPage,
+    lastPageCount: lastProcessedPageRowCount,
+    totalPages: planningPagination.totalPages,
+    totalReports: extractedRows,
+  };
+
   if (stopEarly) {
     inconsistencies.push(
       `Leitura encerrada antecipadamente apos identificar ${items.length} itens extras esperados para o escopo.`
     );
   }
 
-  if (!options?.pageRange && totals.totalReports !== extractedRows) {
+  if (!options?.pageRange && summaryTotals.totalReports !== extractedRows) {
     inconsistencies.push(
-      `Esperado ${totals.totalReports} itens, mas ${extractedRows} linhas foram extraidas.`
+      `Esperado ${summaryTotals.totalReports} itens, mas ${extractedRows} linhas foram extraidas.`
     );
   }
 
@@ -469,11 +555,11 @@ async function processScopePlanning(
     scopeId: scope.scopeId,
     scopeLabel: scope.scopeLabel,
     sourceUrl,
-    expectedTotalReports: totals.totalReports,
+    expectedTotalReports: summaryTotals.totalReports,
     extractedRows,
-    totalPages: totals.totalPages,
-    reportsPerPage: totals.reportsPerPage,
-    lastPageCount: totals.lastPageCount,
+    totalPages: summaryTotals.totalPages,
+    reportsPerPage: summaryTotals.reportsPerPage,
+    lastPageCount: summaryTotals.lastPageCount,
     inconsistencies,
     telemetry: {
       totalsInspectionMs,
@@ -489,9 +575,9 @@ async function processScopePlanning(
   await logger.info("planning", "Telemetria do escopo de planejamento.", {
     scopeId: scope.scopeId,
     scopeLabel: scope.scopeLabel,
-    expectedTotalReports: totals.totalReports,
+    expectedTotalReports: summaryTotals.totalReports,
     extractedRows,
-    totalPages: totals.totalPages,
+    totalPages: summaryTotals.totalPages,
     pagesVisited,
     totalsInspectionMs,
     pageNavigationMs,
@@ -516,6 +602,127 @@ async function processScopePlanning(
   };
 }
 
+async function processScopePlanningSafely(
+  page: Page,
+  scope: ExtractionScope,
+  runId: string,
+  logger: RunLogger,
+  options?: {
+    plannedPathPrefixSegments?: string[];
+    knownReportIds?: Set<string>;
+    stopAfterNewItemsCount?: number;
+    pageRange?: {
+      start: number;
+      end: number;
+    };
+    precomputedSourceUrl?: string;
+    precomputedTotals?: ReportTotals;
+  }
+): Promise<{
+  items: PlannedReportItem[];
+  failures: PlanningFailure[];
+  summary: ScopePlanningSummary;
+}> {
+  try {
+    return await processScopePlanning(page, scope, runId, logger, options);
+  } catch (error) {
+    const errorMessage =
+      error instanceof Error ? error.stack ?? error.message : String(error);
+
+    await logger.error(
+      "planning",
+      "Falha ao processar escopo de planejamento. Escopo sera ignorado.",
+      {
+        scopeId: scope.scopeId,
+        scopeLabel: scope.scopeLabel,
+        error: errorMessage,
+      }
+    );
+
+    return {
+      items: [],
+      failures: [
+        {
+          scopeId: scope.scopeId,
+          sourcePage: 0,
+          sourceRowIndex: 0,
+          rowText: "",
+          reason: `Falha ao processar escopo: ${error instanceof Error ? error.message : String(error)}`,
+          discoveredAt: nowIso(),
+        },
+      ],
+      summary: {
+        scopeId: scope.scopeId,
+        scopeLabel: scope.scopeLabel,
+        sourceUrl: options?.precomputedSourceUrl ?? "",
+        expectedTotalReports: 0,
+        extractedRows: 0,
+        totalPages: 0,
+        reportsPerPage: 0,
+        lastPageCount: 0,
+        inconsistencies: [
+          `Falha no escopo: ${error instanceof Error ? error.message : String(error)}`,
+        ],
+        telemetry: {
+          totalsInspectionMs: 0,
+          pageNavigationMs: 0,
+          tableWaitMs: 0,
+          rowExtractionMs: 0,
+          rowProcessingMs: 0,
+          totalScopeMs: 0,
+          pagesVisited: 0,
+        },
+      },
+    };
+  }
+}
+
+async function mapWithPagePool<T, R>(
+  basePage: Page,
+  items: T[],
+  concurrency: number,
+  worker: (page: Page, item: T, index: number) => Promise<R>,
+  onResult?: (item: T, result: R, index: number) => Promise<void>
+): Promise<R[]> {
+  const poolSize = Math.max(1, Math.min(concurrency, items.length || 1));
+  const pages = await Promise.all(
+    Array.from({ length: poolSize }, async () => basePage.context().newPage())
+  );
+
+  try {
+    const results: R[] = new Array(items.length);
+    let nextIndex = 0;
+
+    await Promise.all(
+      pages.map(async (workerPage) => {
+        while (true) {
+          if (isShutdownRequested()) {
+            return;
+          }
+
+          const currentIndex = nextIndex;
+          nextIndex += 1;
+
+          if (currentIndex >= items.length) {
+            return;
+          }
+
+          results[currentIndex] = await worker(
+            workerPage,
+            items[currentIndex],
+            currentIndex
+          );
+          await onResult?.(items[currentIndex], results[currentIndex], currentIndex);
+        }
+      })
+    );
+
+    return results;
+  } finally {
+    await Promise.all(pages.map((poolPage) => poolPage.close().catch(() => undefined)));
+  }
+}
+
 export async function planReportInventory(
   page: Page,
   runId: string,
@@ -527,6 +734,7 @@ export async function planReportInventory(
   scopeSummaries: ScopePlanningSummary[];
 }> {
   const scopes = await resolveExtractionScopes(page, logger);
+  const scopeSignature = buildScopeSignature(scopes);
   const usingExternalPlan =
     Boolean(config.execution.extractionPlanFile) &&
     (await fileExists(config.execution.extractionPlanFile));
@@ -537,55 +745,81 @@ export async function planReportInventory(
     scopes.length || 1,
     config.execution.planningConcurrency
   );
+  let checkpoint = createEmptyPlanningCheckpoint(scopeSignature);
+
+  if (scopes.length > 0) {
+    const loadedCheckpoint = await loadPlanningCheckpoint(
+      config.paths.planningCheckpointFile
+    );
+
+    if (loadedCheckpoint.scopeSignature === scopeSignature) {
+      checkpoint = loadedCheckpoint;
+
+      for (const item of checkpoint.plannedItems) {
+        uniqueItems.set(item.reportId, item);
+      }
+
+      planningFailures.push(...checkpoint.planningFailures);
+      scopeSummaries.push(...checkpoint.scopeSummaries);
+
+      await logger.info("planning", "Checkpoint de planejamento carregado.", {
+        completedScopes: checkpoint.completedScopeIds.length,
+        restoredItems: checkpoint.plannedItems.length,
+        restoredFailures: checkpoint.planningFailures.length,
+      });
+    } else {
+      await savePlanningCheckpoint(config.paths.planningCheckpointFile, checkpoint);
+
+      await logger.info(
+        "planning",
+        "Checkpoint de planejamento reiniciado para o conjunto atual de escopos.",
+        {
+          scopes: scopes.length,
+        }
+      );
+    }
+  }
+
+  const completedScopeIds = new Set(checkpoint.completedScopeIds);
+  const pendingScopes = scopes.filter((scope) => !completedScopeIds.has(scope.scopeId));
+  let checkpointSaveQueue = Promise.resolve();
 
   await logger.info("planning", "Iniciando processamento paralelo dos escopos.", {
     scopes: scopes.length,
+    pendingScopes: pendingScopes.length,
     planningConcurrency,
   });
 
-  const scopeResults = await mapWithConcurrency(
-    scopes,
+  await mapWithPagePool(
+    page,
+    pendingScopes,
     planningConcurrency,
-    async (scope) => {
-      const scopePage = await page.context().newPage();
+    async (scopePage, scope) => {
+      return await processScopePlanningSafely(scopePage, scope, runId, logger);
+    },
+    async (scope, result) => {
+      mergePlanningResult(uniqueItems, planningFailures, scopeSummaries, result);
+      completedScopeIds.add(scope.scopeId);
 
-      try {
-        return await processScopePlanning(scopePage, scope, runId, logger);
-      } finally {
-        await scopePage.close().catch(() => undefined);
-      }
+      checkpoint = {
+        version: PLANNING_CHECKPOINT_VERSION,
+        updatedAt: checkpoint.updatedAt,
+        scopeSignature,
+        completedScopeIds: [...completedScopeIds],
+        plannedItems: [...uniqueItems.values()],
+        planningFailures: [...planningFailures],
+        scopeSummaries: [...scopeSummaries],
+      };
+
+      checkpointSaveQueue = checkpointSaveQueue
+        .catch(() => undefined)
+        .then(() =>
+          savePlanningCheckpoint(config.paths.planningCheckpointFile, checkpoint)
+        );
+
+      await checkpointSaveQueue;
     }
   );
-
-  for (const result of scopeResults) {
-    planningFailures.push(...result.failures);
-    scopeSummaries.push(result.summary);
-
-    for (const item of result.items) {
-      const existing = uniqueItems.get(item.reportId);
-      if (existing) {
-        const trace = item.filterTrace[0];
-        if (!existing.filterTrace.some((entry) => entry.scopeId === trace.scopeId)) {
-          existing.filterTrace.push(trace);
-        }
-
-        if (existing.plannedPath !== item.plannedPath) {
-          result.summary.inconsistencies.push(
-            `Report ${item.reportId} apareceu com destino divergente: ${existing.plannedPath} vs ${item.plannedPath}.`
-          );
-
-          if (getPlanningSpecificity(item) > getPlanningSpecificity(existing)) {
-            item.filterTrace = existing.filterTrace;
-            uniqueItems.set(item.reportId, item);
-          }
-        }
-
-        continue;
-      }
-
-      uniqueItems.set(item.reportId, item);
-    }
-  }
 
   if (!usingExternalPlan) {
     const orphanRecoveryScopes = buildOrphanRecoveryScopes(scopes);
@@ -605,12 +839,11 @@ export async function planReportInventory(
       { orphanRecoveryScopes: orphanRecoveryScopes.length }
     );
 
-    const orphanInspections = await mapWithConcurrency(
+    const orphanInspections = await mapWithPagePool(
+      page,
       orphanRecoveryScopes,
       planningConcurrency,
-      async (scope) => {
-        const scopePage = await page.context().newPage();
-
+      async (scopePage, scope) => {
         try {
           const inspection = await inspectScopeTotals(scopePage, scope);
           const localKey = buildScopeLocalKey(scope);
@@ -641,8 +874,41 @@ export async function planReportInventory(
             primaryCount,
             expectedOrphanCount,
           };
-        } finally {
-          await scopePage.close().catch(() => undefined);
+        } catch (error) {
+          const reason =
+            error instanceof Error ? error.stack ?? error.message : String(error);
+
+          planningFailures.push({
+            scopeId: scope.scopeId,
+            sourcePage: 0,
+            sourceRowIndex: 0,
+            rowText: "",
+            reason: `Falha ao processar escopo: ${error instanceof Error ? error.message : String(error)}`,
+            discoveredAt: nowIso(),
+          });
+
+          await logger.error(
+            "planning",
+            "Falha ao auditar local do passe extra. Escopo sera ignorado.",
+            {
+              scopeId: scope.scopeId,
+              scopeLabel: scope.scopeLabel,
+              error: reason,
+            }
+          );
+
+          return {
+            scope,
+            sourceUrl: "",
+            totals: {
+              reportsPerPage: 0,
+              lastPageCount: 0,
+              totalPages: 0,
+              totalReports: 0,
+            },
+            primaryCount: 0,
+            expectedOrphanCount: 0,
+          };
         }
       }
     );
@@ -665,30 +931,25 @@ export async function planReportInventory(
     );
 
     const orphanKnownReportIds = new Set(uniqueItems.keys());
-    const orphanResults = await mapWithConcurrency(
+    const orphanResults = await mapWithPagePool(
+      page,
       orphanScopesToScan,
       planningConcurrency,
-      async (inspection) => {
+      async (scopePage, inspection) => {
         if (inspection.totals.totalPages <= 1) {
-          const scopePage = await page.context().newPage();
-
-          try {
-            return await processScopePlanning(
-              scopePage,
-              inspection.scope,
-              runId,
-              logger,
-              {
-                plannedPathPrefixSegments: EXTRA_ORPHAN_PREFIX,
-                knownReportIds: orphanKnownReportIds,
-                stopAfterNewItemsCount: inspection.expectedOrphanCount,
-                precomputedSourceUrl: inspection.sourceUrl,
-                precomputedTotals: inspection.totals,
-              }
-            );
-          } finally {
-            await scopePage.close().catch(() => undefined);
-          }
+          return await processScopePlanningSafely(
+            scopePage,
+            inspection.scope,
+            runId,
+            logger,
+            {
+              plannedPathPrefixSegments: EXTRA_ORPHAN_PREFIX,
+              knownReportIds: orphanKnownReportIds,
+              stopAfterNewItemsCount: inspection.expectedOrphanCount,
+              precomputedSourceUrl: inspection.sourceUrl,
+              precomputedTotals: inspection.totals,
+            }
+          );
         }
 
         const pageRanges = buildPageRanges(
@@ -706,29 +967,24 @@ export async function planReportInventory(
           }
         );
 
-        const chunkResults = await mapWithConcurrency(
+        const chunkResults = await mapWithPagePool(
+          page,
           pageRanges,
           planningConcurrency,
-          async (pageRange) => {
-            const chunkPage = await page.context().newPage();
-
-            try {
-              return await processScopePlanning(
-                chunkPage,
-                inspection.scope,
-                runId,
-                logger,
-                {
-                  plannedPathPrefixSegments: EXTRA_ORPHAN_PREFIX,
-                  knownReportIds: orphanKnownReportIds,
-                  pageRange,
-                  precomputedSourceUrl: inspection.sourceUrl,
-                  precomputedTotals: inspection.totals,
-                }
-              );
-            } finally {
-              await chunkPage.close().catch(() => undefined);
-            }
+          async (chunkPage, pageRange) => {
+            return await processScopePlanningSafely(
+              chunkPage,
+              inspection.scope,
+              runId,
+              logger,
+              {
+                plannedPathPrefixSegments: EXTRA_ORPHAN_PREFIX,
+                knownReportIds: orphanKnownReportIds,
+                pageRange,
+                precomputedSourceUrl: inspection.sourceUrl,
+                precomputedTotals: inspection.totals,
+              }
+            );
           }
         );
 
@@ -774,6 +1030,9 @@ export async function planReportInventory(
       }
     }
   }
+
+  await checkpointSaveQueue.catch(() => undefined);
+  await clearPlanningCheckpoint(config.paths.planningCheckpointFile);
 
   return {
     scopes,

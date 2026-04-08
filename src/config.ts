@@ -69,6 +69,11 @@ export const config = {
   },
   paths: {
     controlFile: path.join(artifactsDir, "control", "execution-state.json"),
+    planningCheckpointFile: path.join(
+      artifactsDir,
+      "control",
+      "planning-state.json"
+    ),
     runsDir: path.join(artifactsDir, "runs"),
   },
 };

@@ -46,6 +46,12 @@ export async function writePlanningArtifacts(
   );
 
   await writeJsonAtomic(path.join(runDir, "planning-failures.json"), failures);
+  await writeJsonAtomic(
+    path.join(runDir, "planning-errors.json"),
+    failures.filter((failure) =>
+      failure.reason.startsWith("Falha ao processar escopo:")
+    )
+  );
 }
 
 export async function writeSummaryArtifacts(

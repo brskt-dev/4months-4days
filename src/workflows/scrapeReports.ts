@@ -9,6 +9,7 @@ import {
 import { RunLogger } from "../logging/runLogger";
 import { closeBrowser, performLogin } from "../login";
 import { planReportInventory } from "../planning/planner";
+import { getShutdownSignal, isShutdownRequested } from "../runtime/shutdown";
 import { goToReports } from "../reports";
 import {
   getControlRecords,
@@ -107,6 +108,34 @@ export async function runReportScraping(): Promise<void> {
       planningFailureCount = planningResult.planningFailures.length;
       scopeSummaries = planningResult.scopeSummaries;
 
+      if (isShutdownRequested()) {
+        await writePlanningArtifacts(
+          runDir,
+          planningResult.plannedItems,
+          planningResult.planningFailures
+        );
+        await saveControlState();
+        await logger.warn(
+          "shutdown",
+          "Shutdown gracioso solicitado durante o planning. Execucao sera encerrada antes da fila de download.",
+          {
+            signal: getShutdownSignal(),
+            plannedItems: plannedItemCount,
+            planningFailures: planningFailureCount,
+          }
+        );
+        await writeRunArtifacts(runDir, {
+          runId,
+          startedAt,
+          finishedAt: nowIso(),
+          plannedItemCount,
+          processedItemCount,
+          planningFailures: planningFailureCount,
+          filtersProcessed: scopeSummaries,
+        });
+        return;
+      }
+
       executionRecords = await synchronizeControlState(
         controlFile,
         planningResult.plannedItems,
@@ -135,6 +164,16 @@ export async function runReportScraping(): Promise<void> {
     });
 
     await saveControlState();
+
+    if (isShutdownRequested()) {
+      await logger.warn(
+        "shutdown",
+        "Shutdown gracioso concluido apos finalizar os itens em andamento.",
+        {
+          signal: getShutdownSignal(),
+        }
+      );
+    }
 
     const finishedAt = nowIso();
     const summary = buildExecutionSummary(

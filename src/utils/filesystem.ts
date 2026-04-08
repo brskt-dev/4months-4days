@@ -27,6 +27,20 @@ export async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
+export async function deleteFileIfExists(filePath: string): Promise<void> {
+  try {
+    await fs.promises.unlink(filePath);
+  } catch (error) {
+    if (
+      !(error instanceof Error) ||
+      !("code" in error) ||
+      String((error as NodeJS.ErrnoException).code ?? "") !== "ENOENT"
+    ) {
+      throw error;
+    }
+  }
+}
+
 export async function writeJsonAtomic(
   filePath: string,
   data: unknown

@@ -277,6 +277,24 @@ export async function extractTotalReports(page: Page): Promise<ReportTotals> {
   };
 }
 
+export async function extractPlanningPagination(page: Page): Promise<{
+  reportsPerPage: number;
+  totalPages: number;
+}> {
+  await waitForReportTable(page);
+
+  const rowsCount = await page.locator(SELECTORS.reportRows).count();
+  const pageLinks = await page.locator(SELECTORS.paginationLinks).allInnerTexts();
+  const pageNumbers = pageLinks
+    .map((text) => parseInt(text.trim(), 10))
+    .filter((value) => !Number.isNaN(value));
+
+  return {
+    reportsPerPage: rowsCount,
+    totalPages: Math.max(1, ...pageNumbers),
+  };
+}
+
 export async function extractRawRowsFromCurrentPage(
   page: Page
 ): Promise<RawReportRow[]> {

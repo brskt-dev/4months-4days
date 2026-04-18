@@ -45,6 +45,18 @@ export const config = {
   execution: {
     extractionPlanFile: process.env.EXTRACTION_PLAN_FILE ?? "",
     resumeFromControl: parseBoolean(process.env.RESUME_FROM_CONTROL, false),
+    pauseBeforeDownloadExecution: parseBoolean(
+      process.env.PAUSE_BEFORE_DOWNLOAD_EXECUTION,
+      false
+    ),
+    pauseBeforeExtraPlanning: parseBoolean(
+      process.env.PAUSE_BEFORE_EXTRA_PLANNING,
+      false
+    ),
+    enableUnknownLocalExtra: parseBoolean(
+      process.env.ENABLE_UNKNOWN_LOCAL_EXTRA,
+      false
+    ),
     maxRetries: parseNumber(process.env.MAX_RETRIES, 3),
     planningConcurrency: Math.max(
       1,
@@ -73,6 +85,16 @@ export const config = {
       artifactsDir,
       "control",
       "planning-state.json"
+    ),
+    extraPlanningReleaseFile: path.join(
+      artifactsDir,
+      "control",
+      "extra-planning.release"
+    ),
+    downloadExecutionReleaseFile: path.join(
+      artifactsDir,
+      "control",
+      "download-execution.release"
     ),
     runsDir: path.join(artifactsDir, "runs"),
   },

@@ -197,6 +197,12 @@ export type ScopePlanningSummary = {
   };
 };
 
+export type PlanningScopeResult = {
+  items: PlannedReportItem[];
+  failures: PlanningFailure[];
+  summary: ScopePlanningSummary;
+};
+
 export type RunArtifacts = {
   runId: string;
   startedAt: string;

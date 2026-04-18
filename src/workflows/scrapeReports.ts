@@ -22,8 +22,53 @@ import {
   writeSummaryArtifacts,
 } from "../storage/runArtifacts";
 import { nowIso, buildRunId } from "../utils/dates";
-import { ensureDir } from "../utils/filesystem";
+import { ensureDir, fileExists } from "../utils/filesystem";
 import { getRunDir } from "../utils/reportPaths";
+
+const DOWNLOAD_RELEASE_POLL_MS = 5_000;
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function awaitDownloadExecutionRelease(
+  logger: RunLogger
+): Promise<boolean> {
+  if (!config.execution.pauseBeforeDownloadExecution) {
+    return true;
+  }
+
+  await logger.warn(
+    "execution",
+    "Execution state preparado. Aguardando liberacao manual antes de iniciar os downloads.",
+    {
+      releaseFile: config.paths.downloadExecutionReleaseFile,
+    }
+  );
+
+  while (true) {
+    if (isShutdownRequested()) {
+      await logger.warn(
+        "execution",
+        "Shutdown solicitado enquanto a execucao aguardava liberacao manual para os downloads."
+      );
+      return false;
+    }
+
+    if (await fileExists(config.paths.downloadExecutionReleaseFile)) {
+      await logger.info(
+        "execution",
+        "Liberacao manual detectada. Iniciando fila de downloads.",
+        {
+          releaseFile: config.paths.downloadExecutionReleaseFile,
+        }
+      );
+      return true;
+    }
+
+    await sleep(DOWNLOAD_RELEASE_POLL_MS);
+  }
+}
 
 export async function runReportScraping(): Promise<void> {
   const runId = buildRunId();
@@ -145,6 +190,21 @@ export async function runReportScraping(): Promise<void> {
     }
 
     await saveControlState();
+
+    const downloadReleaseGranted = await awaitDownloadExecutionRelease(logger);
+    if (!downloadReleaseGranted) {
+      await saveControlState();
+      await writeRunArtifacts(runDir, {
+        runId,
+        startedAt,
+        finishedAt: nowIso(),
+        plannedItemCount,
+        processedItemCount,
+        planningFailures: planningFailureCount,
+        filtersProcessed: scopeSummaries,
+      });
+      return;
+    }
 
     const queue = await buildExecutionQueue(executionRecords, runId, logger);
     await logger.info("execution", "Fila de execucao preparada.", {

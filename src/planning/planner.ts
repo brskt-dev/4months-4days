@@ -2,6 +2,10 @@ import { Page } from "playwright";
 import { config } from "../config";
 import { closeOnboardingPopup } from "../helpers/closePopup";
 import { RunLogger } from "../logging/runLogger";
+import {
+  createEmptyPlanningCheckpoint,
+  mergePlanningScopeResult,
+} from "../planning/checkpointState";
 import { isShutdownRequested } from "../runtime/shutdown";
 import {
   applyFilters,
@@ -15,17 +19,18 @@ import {
   ExtractionPlanFile,
   ExtractionScope,
   FormType,
-  PlanningCheckpoint,
   PlannedReportItem,
   PlanningFailure,
+  PlanningScopeResult,
   ReportTotals,
   ResourcePlace,
   ScopePlanningSummary,
 } from "../types";
 import {
+  appendPlanningCheckpointResult,
   clearPlanningCheckpoint,
   loadPlanningCheckpoint,
-  savePlanningCheckpoint,
+  replacePlanningCheckpoint,
 } from "../storage/planningCheckpointStore";
 import { nowIso } from "../utils/dates";
 import { fileExists, readJsonFile } from "../utils/filesystem";
@@ -42,8 +47,9 @@ import { buildScopeId } from "../utils/sanitize";
 
 const UNKNOWN_YEAR = "UnknownYear";
 const UNKNOWN_FORM = "UnknownForm";
+const UNKNOWN_LOCAL = "UnknownLocal";
 const EXTRA_ORPHAN_PREFIX = ["Extra"];
-const PLANNING_CHECKPOINT_VERSION = 1;
+const EXTRA_PLANNING_RELEASE_POLL_MS = 5_000;
 
 function buildUnknownDateInfo() {
   return {
@@ -51,17 +57,6 @@ function buildUnknownDateInfo() {
     iso: "",
     year: UNKNOWN_YEAR,
   };
-}
-
-function getPlanningSpecificity(
-  item: Pick<PlannedReportItem, "formName" | "filterFormId" | "localName" | "filterLocalId">
-): number {
-  const formScore =
-    item.filterFormId && item.formName !== UNKNOWN_FORM ? 1_000 : 0;
-  const localScore =
-    (item.filterLocalId ? 1 : 0) + (item.localName.match(/>/g) ?? []).length;
-
-  return formScore + localScore;
 }
 
 function buildScopeLabel(scope: Partial<ExtractionScope>): string {
@@ -268,56 +263,50 @@ function buildScopeSignature(scopes: ExtractionScope[]): string {
   );
 }
 
-function createEmptyPlanningCheckpoint(
-  scopeSignature: string
-): PlanningCheckpoint {
-  return {
-    version: PLANNING_CHECKPOINT_VERSION,
-    updatedAt: "",
-    scopeSignature,
-    completedScopeIds: [],
-    plannedItems: [],
-    planningFailures: [],
-    scopeSummaries: [],
-  };
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function mergePlanningResult(
-  uniqueItems: Map<string, PlannedReportItem>,
-  planningFailures: PlanningFailure[],
-  scopeSummaries: ScopePlanningSummary[],
-  result: {
-    items: PlannedReportItem[];
-    failures: PlanningFailure[];
-    summary: ScopePlanningSummary;
+function appendAll<T>(target: T[], source: readonly T[]): void {
+  for (const item of source) {
+    target.push(item);
   }
-): void {
-  planningFailures.push(...result.failures);
-  scopeSummaries.push(result.summary);
+}
 
-  for (const item of result.items) {
-    const existing = uniqueItems.get(item.reportId);
-    if (existing) {
-      const trace = item.filterTrace[0];
-      if (!existing.filterTrace.some((entry) => entry.scopeId === trace.scopeId)) {
-        existing.filterTrace.push(trace);
-      }
+async function awaitExtraPlanningRelease(logger: RunLogger): Promise<boolean> {
+  if (!config.execution.pauseBeforeExtraPlanning) {
+    return true;
+  }
 
-      if (existing.plannedPath !== item.plannedPath) {
-        result.summary.inconsistencies.push(
-          `Report ${item.reportId} apareceu com destino divergente: ${existing.plannedPath} vs ${item.plannedPath}.`
-        );
+  await logger.warn(
+    "planning",
+    "Planning principal concluido. Aguardando liberacao manual antes de iniciar os passes extras.",
+    {
+      releaseFile: config.paths.extraPlanningReleaseFile,
+    }
+  );
 
-        if (getPlanningSpecificity(item) > getPlanningSpecificity(existing)) {
-          item.filterTrace = existing.filterTrace;
-          uniqueItems.set(item.reportId, item);
-        }
-      }
-
-      continue;
+  while (true) {
+    if (isShutdownRequested()) {
+      await logger.warn(
+        "planning",
+        "Shutdown solicitado enquanto o planning aguardava liberacao manual para os passes extras."
+      );
+      return false;
     }
 
-    uniqueItems.set(item.reportId, item);
+    if (await fileExists(config.paths.extraPlanningReleaseFile)) {
+      await logger.info(
+        "planning",
+        "Liberacao manual detectada. Iniciando os passes extras.",
+        {
+          releaseFile: config.paths.extraPlanningReleaseFile,
+        }
+      );
+      return true;
+    }
+
+    await sleep(EXTRA_PLANNING_RELEASE_POLL_MS);
   }
 }
 
@@ -337,6 +326,44 @@ function buildPageRanges(
   }
 
   return ranges;
+}
+
+function buildUnknownLocalRecoveryScope(): ExtractionScope {
+  const periodKey = `${config.reports.defaultStartDate}_${config.reports.defaultEndDate}`;
+
+  return {
+    scopeId: buildScopeId("extra-unknown-local-scope", periodKey),
+    scopeLabel: `Extra__all-forms__${UNKNOWN_LOCAL}__${periodKey}`,
+    formId: null,
+    formName: null,
+    localId: null,
+    localName: UNKNOWN_LOCAL,
+    assetId: null,
+    assetName: null,
+    startDate: config.reports.defaultStartDate,
+    endDate: config.reports.defaultEndDate,
+  };
+}
+
+function buildPlanningReturn(
+  scopes: ExtractionScope[],
+  uniqueItems: Map<string, PlannedReportItem>,
+  planningFailures: PlanningFailure[],
+  scopeSummaries: ScopePlanningSummary[]
+): {
+  scopes: ExtractionScope[];
+  plannedItems: PlannedReportItem[];
+  planningFailures: PlanningFailure[];
+  scopeSummaries: ScopePlanningSummary[];
+} {
+  return {
+    scopes,
+    plannedItems: [...uniqueItems.values()].sort((left, right) =>
+      left.reportId.localeCompare(right.reportId)
+    ),
+    planningFailures,
+    scopeSummaries,
+  };
 }
 
 async function inspectScopeTotals(
@@ -379,11 +406,7 @@ async function processScopePlanning(
     precomputedSourceUrl?: string;
     precomputedTotals?: ReportTotals;
   }
-): Promise<{
-  items: PlannedReportItem[];
-  failures: PlanningFailure[];
-  summary: ScopePlanningSummary;
-}> {
+): Promise<PlanningScopeResult> {
   await logger.info("planning", "Aplicando escopo de planejamento.", {
     scopeId: scope.scopeId,
     scopeLabel: scope.scopeLabel,
@@ -618,11 +641,7 @@ async function processScopePlanningSafely(
     precomputedSourceUrl?: string;
     precomputedTotals?: ReportTotals;
   }
-): Promise<{
-  items: PlannedReportItem[];
-  failures: PlanningFailure[];
-  summary: ScopePlanningSummary;
-}> {
+): Promise<PlanningScopeResult> {
   try {
     return await processScopePlanning(page, scope, runId, logger, options);
   } catch (error) {
@@ -759,8 +778,8 @@ export async function planReportInventory(
         uniqueItems.set(item.reportId, item);
       }
 
-      planningFailures.push(...checkpoint.planningFailures);
-      scopeSummaries.push(...checkpoint.scopeSummaries);
+      appendAll(planningFailures, checkpoint.planningFailures);
+      appendAll(scopeSummaries, checkpoint.scopeSummaries);
 
       await logger.info("planning", "Checkpoint de planejamento carregado.", {
         completedScopes: checkpoint.completedScopeIds.length,
@@ -768,8 +787,6 @@ export async function planReportInventory(
         restoredFailures: checkpoint.planningFailures.length,
       });
     } else {
-      await savePlanningCheckpoint(config.paths.planningCheckpointFile, checkpoint);
-
       await logger.info(
         "planning",
         "Checkpoint de planejamento reiniciado para o conjunto atual de escopos.",
@@ -778,6 +795,8 @@ export async function planReportInventory(
         }
       );
     }
+
+    await replacePlanningCheckpoint(config.paths.planningCheckpointFile, checkpoint);
   }
 
   const completedScopeIds = new Set(checkpoint.completedScopeIds);
@@ -798,30 +817,46 @@ export async function planReportInventory(
       return await processScopePlanningSafely(scopePage, scope, runId, logger);
     },
     async (scope, result) => {
-      mergePlanningResult(uniqueItems, planningFailures, scopeSummaries, result);
+      mergePlanningScopeResult(uniqueItems, planningFailures, scopeSummaries, result);
       completedScopeIds.add(scope.scopeId);
-
-      checkpoint = {
-        version: PLANNING_CHECKPOINT_VERSION,
-        updatedAt: checkpoint.updatedAt,
-        scopeSignature,
-        completedScopeIds: [...completedScopeIds],
-        plannedItems: [...uniqueItems.values()],
-        planningFailures: [...planningFailures],
-        scopeSummaries: [...scopeSummaries],
-      };
 
       checkpointSaveQueue = checkpointSaveQueue
         .catch(() => undefined)
         .then(() =>
-          savePlanningCheckpoint(config.paths.planningCheckpointFile, checkpoint)
+          appendPlanningCheckpointResult(
+            config.paths.planningCheckpointFile,
+            scopeSignature,
+            scope.scopeId,
+            result
+          )
         );
 
       await checkpointSaveQueue;
     }
   );
 
+  if (isShutdownRequested()) {
+    await checkpointSaveQueue.catch(() => undefined);
+    return buildPlanningReturn(
+      scopes,
+      uniqueItems,
+      planningFailures,
+      scopeSummaries
+    );
+  }
+
   if (!usingExternalPlan) {
+    const releaseGranted = await awaitExtraPlanningRelease(logger);
+    if (!releaseGranted) {
+      await checkpointSaveQueue.catch(() => undefined);
+      return buildPlanningReturn(
+        scopes,
+        uniqueItems,
+        planningFailures,
+        scopeSummaries
+      );
+    }
+
     const orphanRecoveryScopes = buildOrphanRecoveryScopes(scopes);
     const primaryCountsByLocalKey = new Map<string, number>();
 
@@ -1012,34 +1047,173 @@ export async function planReportInventory(
     );
 
     for (const result of orphanResults) {
-      planningFailures.push(...result.failures);
-      scopeSummaries.push(result.summary);
+      mergePlanningScopeResult(uniqueItems, planningFailures, scopeSummaries, result);
 
-      for (const item of result.items) {
-        const existing = uniqueItems.get(item.reportId);
-        if (existing) {
-          const trace = item.filterTrace[0];
-          if (!existing.filterTrace.some((entry) => entry.scopeId === trace.scopeId)) {
-            existing.filterTrace.push(trace);
-          }
+      checkpointSaveQueue = checkpointSaveQueue
+        .catch(() => undefined)
+        .then(() =>
+          appendPlanningCheckpointResult(
+            config.paths.planningCheckpointFile,
+            scopeSignature,
+            result.summary.scopeId,
+            result
+          )
+        );
 
-          continue;
+      await checkpointSaveQueue;
+    }
+
+    if (config.execution.enableUnknownLocalExtra && !isShutdownRequested()) {
+      const unknownLocalScope = buildUnknownLocalRecoveryScope();
+
+      await logger.info(
+        "planning",
+        "Iniciando passe final sem filtro de local para capturar relatorios com local desconhecido.",
+        {
+          scopeId: unknownLocalScope.scopeId,
+          knownReportsBeforePass: uniqueItems.size,
+        }
+      );
+
+      try {
+        const inspection = await inspectScopeTotals(page, unknownLocalScope);
+        const unknownLocalKnownReportIds = new Set(uniqueItems.keys());
+        let unknownLocalResult: PlanningScopeResult | undefined;
+
+        if (inspection.totals.totalPages <= 1) {
+          unknownLocalResult = await processScopePlanningSafely(
+            page,
+            unknownLocalScope,
+            runId,
+            logger,
+            {
+              plannedPathPrefixSegments: EXTRA_ORPHAN_PREFIX,
+              knownReportIds: unknownLocalKnownReportIds,
+              precomputedSourceUrl: inspection.sourceUrl,
+              precomputedTotals: inspection.totals,
+            }
+          );
+        } else {
+          const pageRanges = buildPageRanges(
+            inspection.totals.totalPages,
+            planningConcurrency
+          );
+
+          await logger.info(
+            "planning",
+            "Passe final de local desconhecido sera processado em faixas paralelas.",
+            {
+              scopeId: unknownLocalScope.scopeId,
+              totalPages: inspection.totals.totalPages,
+              pageRanges: pageRanges.length,
+            }
+          );
+
+          const chunkResults = await mapWithPagePool(
+            page,
+            pageRanges,
+            planningConcurrency,
+            async (chunkPage, pageRange) => {
+              return await processScopePlanningSafely(
+                chunkPage,
+                unknownLocalScope,
+                runId,
+                logger,
+                {
+                  plannedPathPrefixSegments: EXTRA_ORPHAN_PREFIX,
+                  knownReportIds: unknownLocalKnownReportIds,
+                  pageRange,
+                  precomputedSourceUrl: inspection.sourceUrl,
+                  precomputedTotals: inspection.totals,
+                }
+              );
+            }
+          );
+
+          unknownLocalResult = {
+            items: chunkResults.flatMap((chunk) => chunk.items),
+            failures: chunkResults.flatMap((chunk) => chunk.failures),
+            summary: {
+              scopeId: unknownLocalScope.scopeId,
+              scopeLabel: unknownLocalScope.scopeLabel,
+              sourceUrl: inspection.sourceUrl,
+              expectedTotalReports: inspection.totals.totalReports,
+              extractedRows: chunkResults.reduce(
+                (total, chunk) => total + chunk.summary.extractedRows,
+                0
+              ),
+              totalPages: inspection.totals.totalPages,
+              reportsPerPage: inspection.totals.reportsPerPage,
+              lastPageCount: inspection.totals.lastPageCount,
+              inconsistencies: chunkResults.flatMap(
+                (chunk) => chunk.summary.inconsistencies
+              ),
+            },
+          };
         }
 
-        uniqueItems.set(item.reportId, item);
+        if (unknownLocalResult) {
+          mergePlanningScopeResult(
+            uniqueItems,
+            planningFailures,
+            scopeSummaries,
+            unknownLocalResult
+          );
+
+          checkpointSaveQueue = checkpointSaveQueue
+            .catch(() => undefined)
+            .then(() =>
+              appendPlanningCheckpointResult(
+                config.paths.planningCheckpointFile,
+                scopeSignature,
+                unknownLocalResult.summary.scopeId,
+                unknownLocalResult
+              )
+            );
+
+          await checkpointSaveQueue;
+
+          await logger.info(
+            "planning",
+            "Passe final de local desconhecido concluido.",
+            {
+              scopeId: unknownLocalScope.scopeId,
+              addedItems: unknownLocalResult.items.length,
+              failures: unknownLocalResult.failures.length,
+            }
+          );
+        }
+      } catch (error) {
+        planningFailures.push({
+          scopeId: unknownLocalScope.scopeId,
+          sourcePage: 0,
+          sourceRowIndex: 0,
+          rowText: "",
+          reason: `Falha ao processar escopo: ${error instanceof Error ? error.message : String(error)}`,
+          discoveredAt: nowIso(),
+        });
+
+        await logger.error(
+          "planning",
+          "Falha no passe final sem filtro de local. O passe sera ignorado.",
+          {
+            scopeId: unknownLocalScope.scopeId,
+            error: error instanceof Error ? error.stack ?? error.message : String(error),
+          }
+        );
       }
     }
   }
 
   await checkpointSaveQueue.catch(() => undefined);
-  await clearPlanningCheckpoint(config.paths.planningCheckpointFile);
+  if (!isShutdownRequested()) {
+    await clearPlanningCheckpoint(config.paths.planningCheckpointFile);
+  }
 
-  return {
+  return buildPlanningReturn(
     scopes,
-    plannedItems: [...uniqueItems.values()].sort((left, right) =>
-      left.reportId.localeCompare(right.reportId)
-    ),
+    uniqueItems,
     planningFailures,
-    scopeSummaries,
-  };
+    scopeSummaries
+  );
 }

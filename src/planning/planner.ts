@@ -48,6 +48,7 @@ import { buildScopeId } from "../utils/sanitize";
 const UNKNOWN_YEAR = "UnknownYear";
 const UNKNOWN_FORM = "UnknownForm";
 const UNKNOWN_LOCAL = "UnknownLocal";
+const UNKNOWN_CATCHUP = "UnknownCatchup";
 const EXTRA_ORPHAN_PREFIX = ["Extra"];
 const EXTRA_PLANNING_RELEASE_POLL_MS = 5_000;
 
@@ -106,6 +107,7 @@ function normalizeScope(
     startDate: scope.startDate ?? config.reports.defaultStartDate,
     endDate: scope.endDate ?? config.reports.defaultEndDate,
     extraQueryParams: scope.extraQueryParams,
+    pageRange: scope.pageRange,
   };
 }
 
@@ -113,6 +115,34 @@ async function resolveExtractionScopes(
   page: Page,
   logger: RunLogger
 ): Promise<ExtractionScope[]> {
+  if (config.execution.planningMode === "date-only-catchup") {
+    const periodKey = `${config.reports.defaultStartDate}_${config.reports.defaultEndDate}`;
+    const scope: ExtractionScope = {
+      scopeId: buildScopeId("date-only-catchup-scope", periodKey),
+      scopeLabel: `${UNKNOWN_CATCHUP}__${UNKNOWN_CATCHUP}__${periodKey}`,
+      formId: null,
+      formName: UNKNOWN_CATCHUP,
+      localId: null,
+      localName: UNKNOWN_CATCHUP,
+      assetId: null,
+      assetName: null,
+      startDate: config.reports.defaultStartDate,
+      endDate: config.reports.defaultEndDate,
+    };
+
+    await logger.info(
+      "planning",
+      "Modo de planning por data habilitado. A listagem global sera varrida sem filtros de formulario ou local.",
+      {
+        scopeId: scope.scopeId,
+        startDate: scope.startDate,
+        endDate: scope.endDate,
+      }
+    );
+
+    return [scope];
+  }
+
   const discoveredForms = await extractFormTypes(page);
   const discoveredResourcePlaces = await extractResourcePlaces(page);
   const formsById = new Map(discoveredForms.map((form) => [form.id, form]));
@@ -248,6 +278,18 @@ function buildItemLocalKey(
   return item.filterLocalId ?? item.localName ?? "all-locals";
 }
 
+function isExtraOrphanScope(
+  scope: Pick<ExtractionScope, "scopeId">
+): boolean {
+  return scope.scopeId.startsWith("extra-orphan-scope__");
+}
+
+function isExtraUnknownLocalScope(
+  scope: Pick<ExtractionScope, "scopeId">
+): boolean {
+  return scope.scopeId.startsWith("extra-unknown-local-scope__");
+}
+
 function buildScopeSignature(scopes: ExtractionScope[]): string {
   return JSON.stringify(
     scopes.map((scope) => ({
@@ -259,6 +301,7 @@ function buildScopeSignature(scopes: ExtractionScope[]): string {
       startDate: scope.startDate,
       endDate: scope.endDate,
       extraQueryParams: scope.extraQueryParams ?? null,
+      pageRange: scope.pageRange ?? null,
     }))
   );
 }
@@ -343,6 +386,160 @@ function buildUnknownLocalRecoveryScope(): ExtractionScope {
     startDate: config.reports.defaultStartDate,
     endDate: config.reports.defaultEndDate,
   };
+}
+
+function buildDateOnlyCatchupScopes(
+  scope: ExtractionScope,
+  totalPages: number
+): ExtractionScope[] {
+  const pageRanges = buildPageRanges(
+    totalPages,
+    config.execution.planningConcurrency
+  );
+
+  return pageRanges.map((pageRange) => ({
+    ...scope,
+    scopeId: buildScopeId(scope.scopeId, `pages_${pageRange.start}_${pageRange.end}`),
+    scopeLabel: `${scope.scopeLabel}__pages_${pageRange.start}_${pageRange.end}`,
+    pageRange,
+  }));
+}
+
+function buildChunkedScopePlanningResult(
+  scope: Pick<ExtractionScope, "scopeId" | "scopeLabel">,
+  sourceUrl: string,
+  totals: ReportTotals,
+  chunkResults: PlanningScopeResult[]
+): PlanningScopeResult {
+  return {
+    items: chunkResults.flatMap((chunk) => chunk.items),
+    failures: chunkResults.flatMap((chunk) => chunk.failures),
+    summary: {
+      scopeId: scope.scopeId,
+      scopeLabel: scope.scopeLabel,
+      sourceUrl,
+      expectedTotalReports: totals.totalReports,
+      extractedRows: chunkResults.reduce(
+        (total, chunk) => total + chunk.summary.extractedRows,
+        0
+      ),
+      totalPages: totals.totalPages,
+      reportsPerPage: totals.reportsPerPage,
+      lastPageCount: totals.lastPageCount,
+      inconsistencies: chunkResults.flatMap(
+        (chunk) => chunk.summary.inconsistencies
+      ),
+    },
+  };
+}
+
+async function processRetryPlanExtraScope(
+  page: Page,
+  scope: ExtractionScope,
+  runId: string,
+  logger: RunLogger,
+  planningConcurrency: number,
+  knownReportIds: Set<string>
+): Promise<PlanningScopeResult> {
+  let inspection: Awaited<ReturnType<typeof inspectScopeTotals>>;
+
+  try {
+    inspection = await inspectScopeTotals(page, scope);
+  } catch (error) {
+    const reason =
+      error instanceof Error ? error.stack ?? error.message : String(error);
+
+    await logger.error(
+      "planning",
+      isExtraUnknownLocalScope(scope)
+        ? "Falha ao auditar local desconhecido do plano externo. Escopo sera ignorado."
+        : "Falha ao auditar escopo extra do plano externo. Escopo sera ignorado.",
+      {
+        scopeId: scope.scopeId,
+        scopeLabel: scope.scopeLabel,
+        error: reason,
+      }
+    );
+
+    return {
+      items: [],
+      failures: [
+        {
+          scopeId: scope.scopeId,
+          sourcePage: 0,
+          sourceRowIndex: 0,
+          rowText: "",
+          reason: `Falha ao processar escopo: ${error instanceof Error ? error.message : String(error)}`,
+          discoveredAt: nowIso(),
+        },
+      ],
+      summary: {
+        scopeId: scope.scopeId,
+        scopeLabel: scope.scopeLabel,
+        sourceUrl: "",
+        expectedTotalReports: 0,
+        extractedRows: 0,
+        totalPages: 0,
+        reportsPerPage: 0,
+        lastPageCount: 0,
+        inconsistencies: [],
+      },
+    };
+  }
+
+  if (inspection.totals.totalPages <= 1) {
+    return await processScopePlanningSafely(page, scope, runId, logger, {
+      plannedPathPrefixSegments: EXTRA_ORPHAN_PREFIX,
+      knownReportIds,
+      precomputedSourceUrl: inspection.sourceUrl,
+      precomputedTotals: inspection.totals,
+    });
+  }
+
+  const pageRanges = buildPageRanges(
+    inspection.totals.totalPages,
+    planningConcurrency
+  );
+
+  await logger.info(
+    "planning",
+    isExtraUnknownLocalScope(scope)
+      ? "Passe final de local desconhecido sera processado em faixas paralelas."
+      : "Passe extra sera processado em faixas paralelas.",
+    {
+      scopeId: scope.scopeId,
+      totalPages: inspection.totals.totalPages,
+      pageRanges: pageRanges.length,
+    }
+  );
+
+  const chunkResults = await mapWithPagePool(
+    page,
+    pageRanges,
+    planningConcurrency,
+    async (chunkPage, pageRange) => {
+      return await processScopePlanningSafely(
+        chunkPage,
+        scope,
+        runId,
+        logger,
+        {
+          plannedPathPrefixSegments: EXTRA_ORPHAN_PREFIX,
+          knownReportIds,
+          pageRange,
+          precomputedSourceUrl: inspection.sourceUrl,
+          precomputedTotals: inspection.totals,
+        }
+      );
+    }
+  );
+
+  return buildChunkedScopePlanningResult(
+    scope,
+    inspection.sourceUrl,
+    inspection.totals,
+    chunkResults
+  );
 }
 
 function buildPlanningReturn(
@@ -445,8 +642,9 @@ async function processScopePlanning(
   const items: PlannedReportItem[] = [];
   const failures: PlanningFailure[] = [];
   let stopEarly = false;
-  const startPage = options?.pageRange?.start ?? 1;
-  const endPage = options?.pageRange?.end ?? planningPagination.totalPages;
+  const startPage = options?.pageRange?.start ?? scope.pageRange?.start ?? 1;
+  const endPage =
+    options?.pageRange?.end ?? scope.pageRange?.end ?? planningPagination.totalPages;
   let lastProcessedPageRowCount = 0;
 
   for (let pageIndex = startPage; pageIndex <= endPage && !stopEarly; pageIndex++) {
@@ -745,16 +943,56 @@ async function mapWithPagePool<T, R>(
 export async function planReportInventory(
   page: Page,
   runId: string,
-  logger: RunLogger
+  logger: RunLogger,
+  options?: {
+    knownReportIds?: Set<string>;
+  }
 ): Promise<{
   scopes: ExtractionScope[];
   plannedItems: PlannedReportItem[];
   planningFailures: PlanningFailure[];
   scopeSummaries: ScopePlanningSummary[];
 }> {
-  const scopes = await resolveExtractionScopes(page, logger);
+  const isDateOnlyCatchupMode =
+    config.execution.planningMode === "date-only-catchup";
+  const checkpointFile = isDateOnlyCatchupMode
+    ? config.paths.dateOnlyCatchupPlanningCheckpointFile
+    : config.paths.planningCheckpointFile;
+  const resolvedScopes = await resolveExtractionScopes(page, logger);
+  let scopes = resolvedScopes;
+
+  if (isDateOnlyCatchupMode && resolvedScopes.length === 1) {
+    try {
+      const inspection = await inspectScopeTotals(page, resolvedScopes[0]);
+      scopes = buildDateOnlyCatchupScopes(
+        resolvedScopes[0],
+        inspection.totals.totalPages
+      );
+
+      await logger.info(
+        "planning",
+        "Planning por data particionado em faixas paralelas.",
+        {
+          totalPages: inspection.totals.totalPages,
+          chunkScopes: scopes.length,
+          planningConcurrency: config.execution.planningConcurrency,
+        }
+      );
+    } catch (error) {
+      await logger.warn(
+        "planning",
+        "Falha ao inspecionar a listagem global do planning por data. A execucao seguira sem particionamento em faixas.",
+        {
+          scopeId: resolvedScopes[0].scopeId,
+          error: error instanceof Error ? error.message : String(error),
+        }
+      );
+    }
+  }
+
   const scopeSignature = buildScopeSignature(scopes);
   const usingExternalPlan =
+    !isDateOnlyCatchupMode &&
     Boolean(config.execution.extractionPlanFile) &&
     (await fileExists(config.execution.extractionPlanFile));
   const uniqueItems = new Map<string, PlannedReportItem>();
@@ -764,11 +1002,12 @@ export async function planReportInventory(
     scopes.length || 1,
     config.execution.planningConcurrency
   );
+  const externallyKnownReportIds = options?.knownReportIds ?? new Set<string>();
   let checkpoint = createEmptyPlanningCheckpoint(scopeSignature);
 
   if (scopes.length > 0) {
     const loadedCheckpoint = await loadPlanningCheckpoint(
-      config.paths.planningCheckpointFile
+      checkpointFile
     );
 
     if (loadedCheckpoint.scopeSignature === scopeSignature) {
@@ -796,12 +1035,48 @@ export async function planReportInventory(
       );
     }
 
-    await replacePlanningCheckpoint(config.paths.planningCheckpointFile, checkpoint);
+    await replacePlanningCheckpoint(checkpointFile, checkpoint);
   }
 
   const completedScopeIds = new Set(checkpoint.completedScopeIds);
   const pendingScopes = scopes.filter((scope) => !completedScopeIds.has(scope.scopeId));
+  const standardPendingScopes = usingExternalPlan
+    ? pendingScopes.filter(
+        (scope) =>
+          !isExtraOrphanScope(scope) && !isExtraUnknownLocalScope(scope)
+      )
+    : pendingScopes;
+  const retryExtraOrphanScopes = usingExternalPlan
+    ? pendingScopes.filter((scope) => isExtraOrphanScope(scope))
+    : [];
+  const retryExtraUnknownScopes = usingExternalPlan
+    ? pendingScopes.filter((scope) => isExtraUnknownLocalScope(scope))
+    : [];
   let checkpointSaveQueue = Promise.resolve();
+
+  const appendScopeResult = async (
+    scopeId: string,
+    result: PlanningScopeResult
+  ): Promise<void> => {
+    mergePlanningScopeResult(uniqueItems, planningFailures, scopeSummaries, result);
+    completedScopeIds.add(scopeId);
+
+    checkpointSaveQueue = checkpointSaveQueue
+      .catch(() => undefined)
+      .then(() =>
+        appendPlanningCheckpointResult(
+          checkpointFile,
+          scopeSignature,
+          scopeId,
+          result
+        )
+      );
+
+    await checkpointSaveQueue;
+  };
+
+  const buildRetryKnownReportIds = (): Set<string> =>
+    new Set([...externallyKnownReportIds, ...uniqueItems.keys()]);
 
   await logger.info("planning", "Iniciando processamento paralelo dos escopos.", {
     scopes: scopes.length,
@@ -809,29 +1084,34 @@ export async function planReportInventory(
     planningConcurrency,
   });
 
+  if (usingExternalPlan) {
+    await logger.info(
+      "planning",
+      "Plano externo particionado em escopos principais e escopos extras para preservar a semantica de retry.",
+      {
+        standardScopes: standardPendingScopes.length,
+        extraOrphanScopes: retryExtraOrphanScopes.length,
+        extraUnknownScopes: retryExtraUnknownScopes.length,
+        knownReportsFromExecutionState: externallyKnownReportIds.size,
+      }
+    );
+  }
+
   await mapWithPagePool(
     page,
-    pendingScopes,
+    standardPendingScopes,
     planningConcurrency,
     async (scopePage, scope) => {
-      return await processScopePlanningSafely(scopePage, scope, runId, logger);
+      const retryKnownReportIds = usingExternalPlan
+        ? buildRetryKnownReportIds()
+        : undefined;
+
+      return await processScopePlanningSafely(scopePage, scope, runId, logger, {
+        knownReportIds: retryKnownReportIds,
+      });
     },
     async (scope, result) => {
-      mergePlanningScopeResult(uniqueItems, planningFailures, scopeSummaries, result);
-      completedScopeIds.add(scope.scopeId);
-
-      checkpointSaveQueue = checkpointSaveQueue
-        .catch(() => undefined)
-        .then(() =>
-          appendPlanningCheckpointResult(
-            config.paths.planningCheckpointFile,
-            scopeSignature,
-            scope.scopeId,
-            result
-          )
-        );
-
-      await checkpointSaveQueue;
+      await appendScopeResult(scope.scopeId, result);
     }
   );
 
@@ -845,7 +1125,91 @@ export async function planReportInventory(
     );
   }
 
-  if (!usingExternalPlan) {
+  if (usingExternalPlan && retryExtraOrphanScopes.length > 0) {
+    const retryKnownReportIds = buildRetryKnownReportIds();
+
+    await logger.info(
+      "planning",
+      "Reprocessando escopos extras de orfaos do plano externo com deduplicacao contra o inventario ja conhecido.",
+      {
+        scopes: retryExtraOrphanScopes.length,
+        knownReports: retryKnownReportIds.size,
+      }
+    );
+
+    await mapWithPagePool(
+      page,
+      retryExtraOrphanScopes,
+      planningConcurrency,
+      async (scopePage, scope) => {
+        return await processRetryPlanExtraScope(
+          scopePage,
+          scope,
+          runId,
+          logger,
+          planningConcurrency,
+          retryKnownReportIds
+        );
+      },
+      async (scope, result) => {
+        await appendScopeResult(scope.scopeId, result);
+      }
+    );
+  }
+
+  if (isShutdownRequested()) {
+    await checkpointSaveQueue.catch(() => undefined);
+    return buildPlanningReturn(
+      scopes,
+      uniqueItems,
+      planningFailures,
+      scopeSummaries
+    );
+  }
+
+  if (usingExternalPlan && retryExtraUnknownScopes.length > 0) {
+    const retryKnownReportIds = buildRetryKnownReportIds();
+
+    await logger.info(
+      "planning",
+      "Reprocessando o passe final de local desconhecido a partir do plano externo.",
+      {
+        scopes: retryExtraUnknownScopes.length,
+        knownReports: retryKnownReportIds.size,
+      }
+    );
+
+    await mapWithPagePool(
+      page,
+      retryExtraUnknownScopes,
+      planningConcurrency,
+      async (scopePage, scope) => {
+        return await processRetryPlanExtraScope(
+          scopePage,
+          scope,
+          runId,
+          logger,
+          planningConcurrency,
+          retryKnownReportIds
+        );
+      },
+      async (scope, result) => {
+        await appendScopeResult(scope.scopeId, result);
+      }
+    );
+  }
+
+  if (isShutdownRequested()) {
+    await checkpointSaveQueue.catch(() => undefined);
+    return buildPlanningReturn(
+      scopes,
+      uniqueItems,
+      planningFailures,
+      scopeSummaries
+    );
+  }
+
+  if (!usingExternalPlan && !isDateOnlyCatchupMode) {
     const releaseGranted = await awaitExtraPlanningRelease(logger);
     if (!releaseGranted) {
       await checkpointSaveQueue.catch(() => undefined);
@@ -1053,7 +1417,7 @@ export async function planReportInventory(
         .catch(() => undefined)
         .then(() =>
           appendPlanningCheckpointResult(
-            config.paths.planningCheckpointFile,
+            checkpointFile,
             scopeSignature,
             result.summary.scopeId,
             result
@@ -1164,7 +1528,7 @@ export async function planReportInventory(
             .catch(() => undefined)
             .then(() =>
               appendPlanningCheckpointResult(
-                config.paths.planningCheckpointFile,
+                checkpointFile,
                 scopeSignature,
                 unknownLocalResult.summary.scopeId,
                 unknownLocalResult
@@ -1207,7 +1571,7 @@ export async function planReportInventory(
 
   await checkpointSaveQueue.catch(() => undefined);
   if (!isShutdownRequested()) {
-    await clearPlanningCheckpoint(config.paths.planningCheckpointFile);
+    await clearPlanningCheckpoint(checkpointFile);
   }
 
   return buildPlanningReturn(

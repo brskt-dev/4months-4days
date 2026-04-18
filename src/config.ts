@@ -27,6 +27,10 @@ const reportAssetQueryParam = process.env.REPORT_ASSET_QUERY_PARAM?.trim() ?? ""
 
 const downloadsDir = process.env.DOWNLOADS_DIR ?? "downloads";
 const artifactsDir = process.env.AUTOMATION_ARTIFACTS_DIR ?? "automation-artifacts";
+const planningMode =
+  process.env.PLANNING_MODE?.trim().toLowerCase() === "date-only-catchup"
+    ? "date-only-catchup"
+    : "default";
 
 export const config = {
   email: process.env.PRODUTTIVO_EMAIL ?? "",
@@ -43,6 +47,7 @@ export const config = {
     assetQueryParam: reportAssetQueryParam,
   },
   execution: {
+    planningMode,
     extractionPlanFile: process.env.EXTRACTION_PLAN_FILE ?? "",
     resumeFromControl: parseBoolean(process.env.RESUME_FROM_CONTROL, false),
     pauseBeforeDownloadExecution: parseBoolean(
@@ -85,6 +90,11 @@ export const config = {
       artifactsDir,
       "control",
       "planning-state.json"
+    ),
+    dateOnlyCatchupPlanningCheckpointFile: path.join(
+      artifactsDir,
+      "control",
+      "planning-state.date-only-catchup.json"
     ),
     extraPlanningReleaseFile: path.join(
       artifactsDir,

@@ -74,6 +74,10 @@ export type ExtractionScope = {
   startDate: string;
   endDate: string;
   extraQueryParams?: Record<string, string | string[]>;
+  pageRange?: {
+    start: number;
+    end: number;
+  };
 };
 
 export type ExtractionPlanFile = {

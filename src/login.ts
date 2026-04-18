@@ -18,6 +18,8 @@ async function loginIntoPage(page: Page): Promise<void> {
 export async function performLogin(): Promise<Page> {
   const browser = await chromium.launch({ headless: config.browserHeadless });
   const context = await browser.newContext({ acceptDownloads: true });
+  context.setDefaultNavigationTimeout(TIMEOUTS.navigation);
+  context.setDefaultTimeout(TIMEOUTS.navigation);
   await context.route("**/*", async (route) => {
     const resourceType = route.request().resourceType();
     if (resourceType === "image" || resourceType === "media" || resourceType === "font") {

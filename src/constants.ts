@@ -40,7 +40,7 @@ export const SELECTORS = {
 export const TIMEOUTS = {
   popup: 2_000,
   short: 5_000,
-  navigation: 15_000,
+  navigation: 60_000,
   login: 20_000,
   exportReady: 60_000,
 };

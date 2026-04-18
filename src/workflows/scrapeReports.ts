@@ -142,7 +142,13 @@ export async function runReportScraping(): Promise<void> {
     } else {
       await goToReports(page);
 
-      const planningResult = await planReportInventory(page, runId, logger);
+      const planningResult = await planReportInventory(page, runId, logger, {
+        knownReportIds:
+          config.execution.extractionPlanFile ||
+          config.execution.planningMode === "date-only-catchup"
+          ? new Set(Object.keys(controlFile.records))
+          : undefined,
+      });
       await writePlanningArtifacts(
         runDir,
         planningResult.plannedItems,

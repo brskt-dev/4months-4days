@@ -1,8 +1,9 @@
 import { config } from "../config";
 import { closeOnboardingPopup } from "../helpers/closePopup";
 import { fillReport } from "../helpers/fillReport";
-import { performLogin } from "../login";
+import { closeBrowser, performLogin } from "../login";
 import { FillWorkflowOptions } from "../types";
+import { Page } from "playwright";
 
 export async function runFillWorkflow(
   options: Partial<FillWorkflowOptions> = {}
@@ -17,19 +18,25 @@ export async function runFillWorkflow(
     );
   }
 
-  const page = await performLogin();
-  await closeOnboardingPopup(page);
+  let page: Page | null = null;
 
-  for (let index = 1; index <= repeatCount; index++) {
-    console.log(`\n[${index}/${repeatCount}] Preenchendo atividade ${workId}...`);
+  try {
+    page = await performLogin();
+    await closeOnboardingPopup(page);
 
-    try {
-      await fillReport(page, workId, answerText);
-      console.log(`Preenchimento ${index} concluido.`);
-    } catch (error) {
-      console.error(`Erro no preenchimento ${index}:`, error);
+    for (let index = 1; index <= repeatCount; index++) {
+      console.log(`\n[${index}/${repeatCount}] Preenchendo atividade ${workId}...`);
+
+      try {
+        await fillReport(page, workId, answerText);
+        console.log(`Preenchimento ${index} concluido.`);
+      } catch (error) {
+        console.error(`Erro no preenchimento ${index}:`, error);
+      }
     }
-  }
 
-  console.log("Fluxo de preenchimento finalizado.");
+    console.log("Fluxo de preenchimento finalizado.");
+  } finally {
+    await closeBrowser(page);
+  }
 }

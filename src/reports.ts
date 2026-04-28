@@ -110,6 +110,49 @@ async function waitForExportReady(
   throw new Error("Tempo limite excedido aguardando o arquivo ficar pronto.");
 }
 
+async function readExportProfileOptions(
+  modal: Locator
+): Promise<Array<{ value: string; text: string }>> {
+  return modal.locator(`${SELECTORS.exportProfileSelect} option`).evaluateAll((nodes) =>
+    nodes.map((node) => ({
+      value: node.getAttribute("value") ?? "",
+      text: node.textContent?.replace(/\s+/g, " ").trim() ?? "",
+    }))
+  );
+}
+
+async function selectPreferredExportProfile(
+  page: Page,
+  modal: Locator
+): Promise<void> {
+  const startedAt = Date.now();
+  let normalizedOptions: Array<{ value: string; text: string }> = [];
+
+  while (Date.now() - startedAt < TIMEOUTS.navigation) {
+    const options = await readExportProfileOptions(modal);
+    normalizedOptions = options.filter((option) => option.value.trim());
+
+    if (normalizedOptions.length > 0) {
+      break;
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  if (normalizedOptions.length === 0) {
+    throw new Error("Nenhuma opcao de exportacao disponivel.");
+  }
+
+  const preferredOption =
+    normalizedOptions.find((option) => /pdf/i.test(option.text)) ??
+    normalizedOptions.find((option) => /portable document/i.test(option.text)) ??
+    normalizedOptions[0];
+
+  await modal
+    .locator(SELECTORS.exportProfileSelect)
+    .selectOption(preferredOption.value);
+}
+
 export async function goToReports(page: Page): Promise<Page> {
   await closeOnboardingPopup(page);
   await page.click(SELECTORS.workMenuButton);
@@ -387,6 +430,20 @@ export async function findExportSelectorForReport(
   return resolvedButtonId ? buildIdSelector(resolvedButtonId) : null;
 }
 
+async function closeSpawnedPages(
+  page: Page,
+  knownPages: Set<Page>
+): Promise<void> {
+  await page.waitForTimeout(250).catch(() => undefined);
+
+  const extraPages = page
+    .context()
+    .pages()
+    .filter((candidate) => !knownPages.has(candidate) && candidate !== page);
+
+  await Promise.all(extraPages.map((extraPage) => extraPage.close().catch(() => undefined)));
+}
+
 export async function exportReportPdf(
   page: Page,
   exportButtonSelector: string,
@@ -406,16 +463,7 @@ export async function exportReportPdf(
 
   const modal = page.locator(SELECTORS.exportModalContent);
   await modal.locator(SELECTORS.exportProfileSelect).waitFor();
-
-  const options = await modal
-    .locator(`${SELECTORS.exportProfileSelect} option`)
-    .all();
-  if (options.length === 0) {
-    throw new Error("Nenhuma opcao de exportacao disponivel.");
-  }
-
-  const firstValue = await options[0].getAttribute("value");
-  await modal.locator(SELECTORS.exportProfileSelect).selectOption(firstValue!);
+  await selectPreferredExportProfile(page, modal);
   await modal.locator(SELECTORS.confirmExportButton).click();
 
   const exportRequestId = await tryExtractExportRequestId(modal);
@@ -429,12 +477,19 @@ export async function exportReportPdf(
   await waitForExportReady(page, modal, pollingIntervalMs);
   await hooks?.onReadyToDownload?.();
 
+  const knownPages = new Set(page.context().pages());
   const downloadPromise = page.waitForEvent("download");
-  await modal.locator(SELECTORS.exportDownloadLink).click();
-  const download = await downloadPromise;
+  let download;
 
-  await fs.promises.mkdir(path.dirname(destinationPath), { recursive: true });
-  await download.saveAs(destinationPath);
+  try {
+    await modal.locator(SELECTORS.exportDownloadLink).click();
+    download = await downloadPromise;
+
+    await fs.promises.mkdir(path.dirname(destinationPath), { recursive: true });
+    await download.saveAs(destinationPath);
+  } finally {
+    await closeSpawnedPages(page, knownPages);
+  }
 
   await modal.waitFor({ state: "hidden", timeout: TIMEOUTS.navigation }).catch(
     () => undefined
@@ -443,6 +498,6 @@ export async function exportReportPdf(
 
   return {
     exportRequestId,
-    suggestedFilename: download.suggestedFilename(),
+    suggestedFilename: download?.suggestedFilename() ?? path.basename(destinationPath),
   };
 }

@@ -15,6 +15,22 @@ async function loginIntoPage(page: Page): Promise<void> {
   await page.waitForURL(`**${ROUTES.works}`, { timeout: TIMEOUTS.login });
 }
 
+function isRecoverablePageError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+
+  return /page crashed|target page, context or browser has been closed|has been closed/i.test(
+    message
+  );
+}
+
+async function recyclePage(page: Page): Promise<Page> {
+  const context = page.context();
+
+  await page.close().catch(() => undefined);
+
+  return context.newPage();
+}
+
 export async function performLogin(): Promise<Page> {
   const browser = await chromium.launch({ headless: config.browserHeadless });
   const context = await browser.newContext({ acceptDownloads: true });
@@ -55,21 +71,59 @@ export async function ensureAuthenticatedPage(
   page: Page,
   targetUrl?: string
 ): Promise<Page> {
-  if (targetUrl) {
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
-  }
+  let activePage = page;
 
-  if (await isAuthenticationRequired(page)) {
-    console.warn("Sessao expirada detectada. Reautenticando...");
-    await loginIntoPage(page);
+  try {
     if (targetUrl) {
-      await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+      await activePage.goto(targetUrl, { waitUntil: "domcontentloaded" });
     }
-  }
 
-  return page;
+    if (await isAuthenticationRequired(activePage)) {
+      console.warn("Sessao expirada detectada. Reautenticando...");
+      await loginIntoPage(activePage);
+      if (targetUrl) {
+        await activePage.goto(targetUrl, { waitUntil: "domcontentloaded" });
+      }
+    }
+
+    return activePage;
+  } catch (error) {
+    if (!isRecoverablePageError(error)) {
+      throw error;
+    }
+
+    const browser = activePage.context().browser();
+    if (!browser?.isConnected()) {
+      throw error;
+    }
+
+    console.warn(
+      "Pagina do Chromium foi encerrada ou crashou. Reciclando a aba autenticada."
+    );
+
+    activePage = await recyclePage(activePage);
+    await loginIntoPage(activePage);
+
+    if (targetUrl) {
+      await activePage.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    }
+
+    return activePage;
+  }
 }
 
-export async function closeBrowser(page: Page): Promise<void> {
-  await page.context().browser()?.close();
+export async function closeBrowser(page: Page | null | undefined): Promise<void> {
+  if (!page) {
+    return;
+  }
+
+  const context = page.context();
+  const browser = context.browser();
+
+  if (browser) {
+    await browser.close().catch(() => undefined);
+    return;
+  }
+
+  await context.close().catch(() => undefined);
 }

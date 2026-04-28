@@ -16,6 +16,25 @@ function parseNumber(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function parseClampedNumber(
+  value: string | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+  label: string
+): number {
+  const parsed = parseNumber(value, fallback);
+  const normalized = Math.max(minimum, Math.min(parsed, maximum));
+
+  if (parsed !== normalized) {
+    console.warn(
+      `${label}=${parsed} ajustado para ${normalized} para evitar excesso de abas/processos do Chromium.`
+    );
+  }
+
+  return normalized;
+}
+
 const baseUrl = (
   process.env.PRODUTTIVO_BASE_URL ?? "https://app.produttivo.com.br"
 ).replace(/\/$/, "");
@@ -27,10 +46,32 @@ const reportAssetQueryParam = process.env.REPORT_ASSET_QUERY_PARAM?.trim() ?? ""
 
 const downloadsDir = process.env.DOWNLOADS_DIR ?? "downloads";
 const artifactsDir = process.env.AUTOMATION_ARTIFACTS_DIR ?? "automation-artifacts";
+const downloadTempDir =
+  process.env.DOWNLOAD_TEMP_DIR ?? path.join("temp", "download-staging");
 const planningMode =
   process.env.PLANNING_MODE?.trim().toLowerCase() === "date-only-catchup"
     ? "date-only-catchup"
     : "default";
+const deliveryMode =
+  process.env.DELIVERY_MODE?.trim().toLowerCase() === "sharepoint-session-rest"
+    ? "sharepoint-session-rest"
+    : "local";
+const maxPlanningConcurrency = Math.max(
+  1,
+  parseNumber(process.env.MAX_PLANNING_CONCURRENCY, 12)
+);
+const maxDownloadConcurrency = Math.max(
+  1,
+  parseNumber(process.env.MAX_DOWNLOAD_CONCURRENCY, 6)
+);
+const maxSharePointUploadConcurrency = Math.max(
+  1,
+  parseNumber(process.env.MAX_SHAREPOINT_UPLOAD_CONCURRENCY, 4)
+);
+const maxPreflightConcurrency = Math.max(
+  1,
+  parseNumber(process.env.MAX_PREFLIGHT_CONCURRENCY, 16)
+);
 
 export const config = {
   email: process.env.PRODUTTIVO_EMAIL ?? "",
@@ -38,6 +79,7 @@ export const config = {
   baseUrl,
   browserHeadless: parseBoolean(process.env.PLAYWRIGHT_HEADLESS, false),
   downloadsDir,
+  downloadTempDir,
   artifactsDir,
   reports: {
     accountId: process.env.PRODUTTIVO_ACCOUNT_ID ?? "259345",
@@ -48,6 +90,7 @@ export const config = {
   },
   execution: {
     planningMode,
+    deliveryMode,
     extractionPlanFile: process.env.EXTRACTION_PLAN_FILE ?? "",
     resumeFromControl: parseBoolean(process.env.RESUME_FROM_CONTROL, false),
     pauseBeforeDownloadExecution: parseBoolean(
@@ -63,13 +106,33 @@ export const config = {
       false
     ),
     maxRetries: parseNumber(process.env.MAX_RETRIES, 3),
-    planningConcurrency: Math.max(
+    planningConcurrency: parseClampedNumber(
+      process.env.PLANNING_CONCURRENCY,
       1,
-      parseNumber(process.env.PLANNING_CONCURRENCY, 1)
+      1,
+      maxPlanningConcurrency,
+      "PLANNING_CONCURRENCY"
     ),
-    downloadConcurrency: Math.max(
+    downloadConcurrency: parseClampedNumber(
+      process.env.DOWNLOAD_CONCURRENCY,
       1,
-      parseNumber(process.env.DOWNLOAD_CONCURRENCY, 1)
+      1,
+      maxDownloadConcurrency,
+      "DOWNLOAD_CONCURRENCY"
+    ),
+    sharepointUploadConcurrency: parseClampedNumber(
+      process.env.SHAREPOINT_UPLOAD_CONCURRENCY,
+      4,
+      1,
+      maxSharePointUploadConcurrency,
+      "SHAREPOINT_UPLOAD_CONCURRENCY"
+    ),
+    preflightConcurrency: parseClampedNumber(
+      process.env.PREFLIGHT_CONCURRENCY,
+      12,
+      1,
+      maxPreflightConcurrency,
+      "PREFLIGHT_CONCURRENCY"
     ),
     pollingIntervalMs: Math.max(
       500,
@@ -77,6 +140,20 @@ export const config = {
     ),
     skipValidated: parseBoolean(process.env.SKIP_VALIDATED, true),
     overwriteExisting: parseBoolean(process.env.OVERWRITE_EXISTING, false),
+    deleteTempAfterRemoteUpload: parseBoolean(
+      process.env.DELETE_TEMP_AFTER_REMOTE_UPLOAD,
+      true
+    ),
+    pauseBeforeSharePointLogin: parseBoolean(
+      process.env.PAUSE_BEFORE_SHAREPOINT_LOGIN,
+      true
+    ),
+  },
+  sharepoint: {
+    targetUrl: process.env.SHAREPOINT_TARGET_URL ?? "",
+    siteUrl: process.env.SHAREPOINT_SITE_URL ?? "",
+    rootFolderServerRelativePath:
+      process.env.SHAREPOINT_ROOT_FOLDER_SERVER_RELATIVE_PATH ?? "",
   },
   fill: {
     workId: parseNumber(process.env.FILL_WORK_ID, 0),
@@ -105,6 +182,11 @@ export const config = {
       artifactsDir,
       "control",
       "download-execution.release"
+    ),
+    sharepointLoginReleaseFile: path.join(
+      artifactsDir,
+      "control",
+      "sharepoint-login.release"
     ),
     runsDir: path.join(artifactsDir, "runs"),
   },

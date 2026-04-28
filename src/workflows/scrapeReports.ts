@@ -1,3 +1,4 @@
+import { Page } from "playwright";
 import { config } from "../config";
 import { buildExecutionSummary } from "../execution/summary";
 import {
@@ -11,16 +12,21 @@ import { closeBrowser, performLogin } from "../login";
 import { planReportInventory } from "../planning/planner";
 import { getShutdownSignal, isShutdownRequested } from "../runtime/shutdown";
 import { goToReports } from "../reports";
+import { prepareSharePointSession } from "../sharepoint/session";
 import {
   getControlRecords,
   loadControlFile,
+  appendControlRecordUpdates,
   saveControlFile,
 } from "../storage/controlStore";
 import {
+  appendExecutionResultArtifacts,
+  writeExecutionArtifacts,
   writePlanningArtifacts,
   writeRunArtifacts,
   writeSummaryArtifacts,
 } from "../storage/runArtifacts";
+import { ControlRecord } from "../types";
 import { nowIso, buildRunId } from "../utils/dates";
 import { ensureDir, fileExists } from "../utils/filesystem";
 import { getRunDir } from "../utils/reportPaths";
@@ -78,26 +84,50 @@ export async function runReportScraping(): Promise<void> {
   await ensureDir(runDir);
 
   const logger = new RunLogger(runId, runDir);
-  const page = await performLogin();
+  let page: Page | null = null;
   let controlFile = await loadControlFile(config.paths.controlFile);
   let plannedItemCount = 0;
   let planningFailureCount = 0;
   let processedItemCount = 0;
   let scopeSummaries: ReturnType<typeof buildExecutionSummary>["filtersProcessed"] =
     [];
+  let sharePointSession: Awaited<ReturnType<typeof prepareSharePointSession>> =
+    null;
   let controlSaveQueue = Promise.resolve();
-  let processedSinceLastSave = 0;
 
-  const saveControlState = async (): Promise<void> => {
+  const enqueueControlPersistence = async (
+    taskFactory: () => Promise<void>
+  ): Promise<void> => {
     const task = controlSaveQueue
       .catch(() => undefined)
-      .then(() => saveControlFile(config.paths.controlFile, controlFile));
+      .then(taskFactory);
 
     controlSaveQueue = task.catch(() => undefined);
     await task;
   };
 
+  const saveControlState = async (): Promise<void> =>
+    enqueueControlPersistence(() =>
+      saveControlFile(config.paths.controlFile, controlFile)
+    );
+
+  const appendExecutionState = async (
+    records: ControlRecord[],
+    outcomeType: "processed" | "skipped_before_queue"
+  ): Promise<void> => {
+    if (records.length === 0) {
+      return;
+    }
+
+    await enqueueControlPersistence(async () => {
+      await appendControlRecordUpdates(config.paths.controlFile, records);
+      await appendExecutionResultArtifacts(runDir, runId, outcomeType, records);
+    });
+  };
+
   try {
+    page = await performLogin();
+
     await writeRunArtifacts(runDir, {
       runId,
       startedAt,
@@ -111,10 +141,13 @@ export async function runReportScraping(): Promise<void> {
     await logger.info("startup", "Execucao iniciada.", {
       runId,
       downloadsDir: config.downloadsDir,
+      downloadTempDir: config.downloadTempDir,
       artifactsDir: config.artifactsDir,
       concurrency: config.execution.downloadConcurrency,
+      sharepointUploadConcurrency: config.execution.sharepointUploadConcurrency,
       maxRetries: config.execution.maxRetries,
       resumeFromControl: config.execution.resumeFromControl,
+      deliveryMode: config.execution.deliveryMode,
     });
 
     let executionRecords;
@@ -213,20 +246,50 @@ export async function runReportScraping(): Promise<void> {
     }
 
     const queue = await buildExecutionQueue(executionRecords, runId, logger);
+    const queuedReportIds = new Set(queue.map((record) => record.reportId));
+    const skippedBeforeQueue = executionRecords.filter(
+      (record) =>
+        record.lastPlannedRunId === runId &&
+        !queuedReportIds.has(record.reportId)
+    );
+
+    await appendExecutionState(skippedBeforeQueue, "skipped_before_queue");
+
     await logger.info("execution", "Fila de execucao preparada.", {
       plannedItems: plannedItemCount,
       planningFailures: planningFailureCount,
       queueSize: queue.length,
+      skippedBeforeQueue: skippedBeforeQueue.length,
+      workerCount: Math.min(config.execution.downloadConcurrency, queue.length),
+      sharepointUploadWorkers:
+        config.execution.deliveryMode === "sharepoint-session-rest"
+          ? Math.min(config.execution.sharepointUploadConcurrency, queue.length)
+          : 0,
     });
     processedItemCount = queue.length;
 
-    await processExecutionQueue(page, queue, runId, logger, async () => {
-      processedSinceLastSave += 1;
+    sharePointSession = await prepareSharePointSession(page, logger);
+    if (
+      config.execution.deliveryMode === "sharepoint-session-rest" &&
+      !sharePointSession
+    ) {
+      await saveControlState();
+      await writeRunArtifacts(runDir, {
+        runId,
+        startedAt,
+        finishedAt: nowIso(),
+        plannedItemCount,
+        processedItemCount,
+        planningFailures: planningFailureCount,
+        filtersProcessed: scopeSummaries,
+      });
+      return;
+    }
 
-      if (processedSinceLastSave >= 10) {
-        processedSinceLastSave = 0;
-        await saveControlState();
-      }
+    await processExecutionQueue(page, queue, runId, logger, async (record) => {
+      await appendExecutionState([record], "processed");
+    }, {
+      sharePointClient: sharePointSession?.client,
     });
 
     await saveControlState();
@@ -259,6 +322,7 @@ export async function runReportScraping(): Promise<void> {
       planningFailures: planningFailureCount,
       filtersProcessed: scopeSummaries,
     });
+    await writeExecutionArtifacts(runDir, runId, getControlRecords(controlFile));
     await writeSummaryArtifacts(runDir, summary);
 
     await logger.info("finish", "Execucao concluida.", {
@@ -271,6 +335,9 @@ export async function runReportScraping(): Promise<void> {
     const finishedAt = nowIso();
 
     await saveControlState();
+    await writeExecutionArtifacts(runDir, runId, getControlRecords(controlFile)).catch(
+      () => undefined
+    );
     await writeRunArtifacts(runDir, {
       runId,
       startedAt,
@@ -289,6 +356,7 @@ export async function runReportScraping(): Promise<void> {
     );
     throw error;
   } finally {
+    await sharePointSession?.close().catch(() => undefined);
     await closeBrowser(page);
   }
 }

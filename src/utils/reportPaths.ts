@@ -50,3 +50,30 @@ export function getRunDir(runId: string): string {
 export function toArtifactRelativePath(item: Pick<PlannedReportItem, "plannedPath">): string {
   return path.normalize(item.plannedPath);
 }
+
+export function buildTempDownloadPath(
+  item: Pick<PlannedReportItem, "plannedPath">
+): string {
+  const relativePath = path.relative(config.downloadsDir, item.plannedPath);
+  return path.join(config.downloadTempDir, relativePath);
+}
+
+export function buildRemoteRelativePath(
+  item: Pick<PlannedReportItem, "plannedPath">
+): string {
+  return path
+    .relative(config.downloadsDir, item.plannedPath)
+    .split(path.sep)
+    .join("/");
+}
+
+export function buildSharePointRemotePath(
+  item: Pick<PlannedReportItem, "plannedPath">
+): string {
+  const root = config.sharepoint.rootFolderServerRelativePath
+    .replace(/\\/g, "/")
+    .replace(/\/$/, "");
+  const relative = buildRemoteRelativePath(item).replace(/^\/+/, "");
+
+  return `${root}/${relative}`;
+}

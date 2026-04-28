@@ -2,5 +2,6 @@ dist/
 node_modules/
 .env
 downloads/
+temp/
 automation-artifacts/
 bkp/

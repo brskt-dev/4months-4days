@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { CSV_HEADERS } from "../constants";
 import {
+  ControlRecord,
+  ExecutionResultArtifactEntry,
   ExecutionSummary,
   PlannedReportItem,
   PlanningFailure,
@@ -9,6 +11,7 @@ import {
 } from "../types";
 import { writeCsvFile } from "../utils/csv";
 import { ensureDir, writeJsonAtomic } from "../utils/filesystem";
+import { nowIso } from "../utils/dates";
 
 export async function writeRunArtifacts(
   runDir: string,
@@ -83,4 +86,130 @@ export async function writeSummaryArtifacts(
   const summaryPath = path.join(runDir, "summary.txt");
   await ensureDir(path.dirname(summaryPath));
   await fs.promises.writeFile(summaryPath, `${lines.join("\n")}\n`, "utf8");
+}
+
+function buildExecutionResultEntry(
+  runId: string,
+  outcomeType: ExecutionResultArtifactEntry["outcomeType"],
+  record: ControlRecord
+): ExecutionResultArtifactEntry {
+  return {
+    timestamp: nowIso(),
+    runId,
+    outcomeType,
+    reportId: record.reportId,
+    formName: record.formName,
+    localName: record.localName,
+    year: record.year,
+    sourceUrl: record.sourceUrl,
+    plannedPath: record.plannedPath,
+    tempPath: record.tempPath,
+    deliveryMode: record.deliveryMode,
+    remoteDeliveryPath: record.remoteDeliveryPath,
+    remoteDeliveryUrl: record.remoteDeliveryUrl,
+    remoteUploadedAt: record.remoteUploadedAt,
+    executionStatus: record.executionStatus,
+    extractionStatus: record.extractionStatus,
+    downloadStatus: record.downloadStatus,
+    validationStatus: record.validationStatus,
+    attemptCount: record.attemptCount,
+    errorStage: record.errorStage,
+    errorMessage: record.errorMessage,
+    skippedReason: record.skippedReason,
+    fileSizeBytes: record.fileSizeBytes,
+    lastAttemptAt: record.lastAttemptAt,
+    downloadedAt: record.downloadedAt,
+    validatedAt: record.validatedAt,
+  };
+}
+
+export async function appendExecutionResultArtifacts(
+  runDir: string,
+  runId: string,
+  outcomeType: ExecutionResultArtifactEntry["outcomeType"],
+  records: ControlRecord[]
+): Promise<void> {
+  if (records.length === 0) {
+    return;
+  }
+
+  const filePath = path.join(runDir, "download-results.ndjson");
+  await ensureDir(path.dirname(filePath));
+  const lines = records.map((record) =>
+    JSON.stringify(buildExecutionResultEntry(runId, outcomeType, record))
+  );
+  await fs.promises.appendFile(filePath, `${lines.join("\n")}\n`, "utf8");
+}
+
+export async function writeExecutionArtifacts(
+  runDir: string,
+  runId: string,
+  records: ControlRecord[]
+): Promise<void> {
+  const runRecords = records.filter((record) => record.lastPlannedRunId === runId);
+  const entries = runRecords.map((record) =>
+    buildExecutionResultEntry(
+      runId,
+      record.skippedReason && record.lastExecutionRunId === runId
+        ? "skipped_before_queue"
+        : "processed",
+      record
+    )
+  );
+
+  await writeJsonAtomic(path.join(runDir, "download-results.json"), entries);
+  await writeCsvFile(
+    path.join(runDir, "download-results.csv"),
+    [
+      "ReportId",
+      "FormName",
+      "LocalName",
+      "Year",
+      "DeliveryMode",
+      "ExecutionStatus",
+      "ExtractionStatus",
+      "DownloadStatus",
+      "ValidationStatus",
+      "AttemptCount",
+      "PlannedPath",
+      "TempPath",
+      "RemoteDeliveryPath",
+      "RemoteDeliveryUrl",
+      "RemoteUploadedAt",
+      "ErrorStage",
+      "ErrorMessage",
+      "SkippedReason",
+      "FileSizeBytes",
+      "LastAttemptAt",
+      "DownloadedAt",
+      "ValidatedAt",
+      "SourceUrl",
+    ],
+    entries.map((entry) => ({
+      ReportId: entry.reportId,
+      FormName: entry.formName,
+      LocalName: entry.localName,
+      Year: entry.year,
+      DeliveryMode: entry.deliveryMode,
+      ExecutionStatus: entry.executionStatus,
+      ExtractionStatus: entry.extractionStatus,
+      DownloadStatus: entry.downloadStatus,
+      ValidationStatus: entry.validationStatus,
+      AttemptCount: String(entry.attemptCount),
+      PlannedPath: entry.plannedPath,
+      TempPath: entry.tempPath ?? "",
+      RemoteDeliveryPath: entry.remoteDeliveryPath ?? "",
+      RemoteDeliveryUrl: entry.remoteDeliveryUrl ?? "",
+      RemoteUploadedAt: entry.remoteUploadedAt ?? "",
+      ErrorStage: entry.errorStage ?? "",
+      ErrorMessage: entry.errorMessage ?? "",
+      SkippedReason: entry.skippedReason ?? "",
+      FileSizeBytes:
+        entry.fileSizeBytes === null ? "" : String(entry.fileSizeBytes),
+      LastAttemptAt: entry.lastAttemptAt ?? "",
+      DownloadedAt: entry.downloadedAt ?? "",
+      ValidatedAt: entry.validatedAt ?? "",
+      SourceUrl: entry.sourceUrl,
+    }))
+  );
 }

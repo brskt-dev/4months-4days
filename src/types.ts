@@ -56,6 +56,8 @@ export type ExecutionStatus =
   | "skipped"
   | "error";
 
+export type DeliveryMode = "local" | "sharepoint-session-rest";
+
 export type ReportDateInfo = {
   raw: string;
   iso: string;
@@ -154,7 +156,33 @@ export type PlanningFailure = {
   discoveredAt: string;
 };
 
-export type ControlRecord = PlannedReportItem & {
+export type ControlRecord = {
+  reportId: string;
+  formName: string;
+  localName: string;
+  assetName: string | null;
+  reportDate: string;
+  reportDateRaw: string;
+  year: string;
+  sourcePage: number;
+  sourceRowIndex: number;
+  sourceUrl: string;
+  exportButtonId: string | null;
+  filterFormId: string | null;
+  filterLocalId: string | null;
+  filterAssetId: string | null;
+  filterStartDate: string;
+  filterEndDate: string;
+  plannedFolder: string;
+  plannedFilename: string;
+  plannedPath: string;
+  tempPath: string | null;
+  deliveryMode: DeliveryMode;
+  remoteDeliveryPath: string | null;
+  remoteDeliveryUrl: string | null;
+  remoteUploadedAt: string | null;
+  discoveredAt: string;
+  discoveredInRunId: string;
   planningStatus: PlanningStatus;
   extractionStatus: ExtractionStatus;
   downloadStatus: DownloadStatus;
@@ -178,6 +206,35 @@ export type ControlFile = {
   version: number;
   updatedAt: string;
   records: Record<string, ControlRecord>;
+};
+
+export type ExecutionResultArtifactEntry = {
+  timestamp: string;
+  runId: string;
+  outcomeType: "processed" | "skipped_before_queue";
+  reportId: string;
+  formName: string;
+  localName: string;
+  year: string;
+  sourceUrl: string;
+  plannedPath: string;
+  tempPath: string | null;
+  deliveryMode: DeliveryMode;
+  remoteDeliveryPath: string | null;
+  remoteDeliveryUrl: string | null;
+  remoteUploadedAt: string | null;
+  executionStatus: ExecutionStatus;
+  extractionStatus: ExtractionStatus;
+  downloadStatus: DownloadStatus;
+  validationStatus: ValidationStatus;
+  attemptCount: number;
+  errorStage: string | null;
+  errorMessage: string | null;
+  skippedReason: string | null;
+  fileSizeBytes: number | null;
+  lastAttemptAt: string | null;
+  downloadedAt: string | null;
+  validatedAt: string | null;
 };
 
 export type ScopePlanningSummary = {

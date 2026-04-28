@@ -49,20 +49,39 @@ export async function writeJsonAtomic(
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random()
     .toString(16)
     .slice(2)}.tmp`;
+  const backupPath = `${filePath}.${process.pid}.bak`;
   await fs.promises.writeFile(tempPath, JSON.stringify(data, null, 2), "utf8");
 
   let lastError: unknown = null;
 
   for (let attempt = 1; attempt <= 5; attempt++) {
+    let backupCreated = false;
+
     try {
-      await fs.promises.copyFile(tempPath, filePath);
-      await fs.promises.unlink(tempPath).catch(() => undefined);
+      await deleteFileIfExists(backupPath);
+
+      if (await fileExists(filePath)) {
+        await fs.promises.rename(filePath, backupPath);
+        backupCreated = true;
+      }
+
+      await fs.promises.rename(tempPath, filePath);
+
+      if (backupCreated) {
+        await fs.promises.unlink(backupPath).catch(() => undefined);
+      }
+
       return;
     } catch (error) {
       lastError = error;
 
+      if (backupCreated && !(await fileExists(filePath))) {
+        await fs.promises.rename(backupPath, filePath).catch(() => undefined);
+      }
+
       if (!isRetryableFileWriteError(error) || attempt === 5) {
         await fs.promises.unlink(tempPath).catch(() => undefined);
+        await fs.promises.unlink(backupPath).catch(() => undefined);
         throw error;
       }
 
@@ -71,6 +90,7 @@ export async function writeJsonAtomic(
   }
 
   await fs.promises.unlink(tempPath).catch(() => undefined);
+  await fs.promises.unlink(backupPath).catch(() => undefined);
   throw lastError instanceof Error
     ? lastError
     : new Error("Falha ao persistir arquivo JSON.");
@@ -98,6 +118,19 @@ export async function validatePdfFile(filePath: string): Promise<{
   sizeBytes: number;
   reason: string | null;
 }> {
+  return validatePdfFileWithOptions(filePath);
+}
+
+export async function validatePdfFileWithOptions(
+  filePath: string,
+  options?: {
+    skipSignatureCheck?: boolean;
+  }
+): Promise<{
+  valid: boolean;
+  sizeBytes: number;
+  reason: string | null;
+}> {
   try {
     const stats = await fs.promises.stat(filePath);
     if (!stats.isFile()) {
@@ -116,12 +149,18 @@ export async function validatePdfFile(filePath: string): Promise<{
       };
     }
 
+    if (options?.skipSignatureCheck) {
+      return { valid: true, sizeBytes: stats.size, reason: null };
+    }
+
     const handle = await fs.promises.open(filePath, "r");
     try {
-      const buffer = Buffer.alloc(4);
-      await handle.read(buffer, 0, 4, 0);
+      const probeLength = Math.min(stats.size, 1024);
+      const buffer = Buffer.alloc(probeLength);
+      await handle.read(buffer, 0, probeLength, 0);
+      const headerText = buffer.toString("latin1");
 
-      if (buffer.toString("utf8") !== "%PDF") {
+      if (!headerText.includes("%PDF")) {
         return {
           valid: false,
           sizeBytes: stats.size,

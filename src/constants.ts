@@ -42,7 +42,7 @@ export const TIMEOUTS = {
   short: 5_000,
   navigation: 60_000,
   login: 20_000,
-  exportReady: 60_000,
+  exportReady: 180_000,
 };
 
 export const CSV_HEADERS = [
